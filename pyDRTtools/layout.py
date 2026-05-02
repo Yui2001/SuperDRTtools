@@ -1,9 +1,8 @@
-#-*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
-__authors__ = 'Francesco Ciucci, Adeleke Maradesa, Baptiste Py, Ting Hei Wan'
+__authors__ = 'Francesco Ciucci, Adeleke Maradesa, Baptiste Py, Ting Hei Wan, DongXu Ye'
 
 __date__ = '12th June 2024'
-
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -11,10 +10,11 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
-        MainWindow.resize(1625, 996)
+        MainWindow.resize(1625, 1000)
         self.centralwidget = QtWidgets.QWidget(MainWindow)
         self.centralwidget.setObjectName("centralwidget")
         self.frame = QtWidgets.QFrame(self.centralwidget)
+        self.frame.setStyleSheet("border:0px; background: transparent;")
         self.frame.setGeometry(QtCore.QRect(320, 0, 931, 951))
         self.frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
         self.frame.setFrameShadow(QtWidgets.QFrame.Raised)
@@ -29,15 +29,23 @@ class Ui_MainWindow(object):
         self.show_layout.setFrameShadow(QtWidgets.QFrame.Raised)
         self.show_layout.setObjectName("show_layout")
         self.show_EIS = QtWidgets.QPushButton(self.show_layout)
-        self.show_EIS.setGeometry(QtCore.QRect(0, 10, 81, 28))
+        self.show_EIS.setGeometry(QtCore.QRect(0, 10, 76, 28))
         font = QtGui.QFont()
         font.setPointSize(9)
         font.setBold(True)
         font.setWeight(75)
         self.show_EIS.setFont(font)
         self.show_EIS.setObjectName("show_EIS")
+        self.show_KK_res = QtWidgets.QPushButton(self.show_layout)
+        self.show_KK_res.setGeometry(QtCore.QRect(86, 10, 176, 28))
+        font = QtGui.QFont()
+        font.setPointSize(9)
+        font.setBold(True)
+        font.setWeight(75)
+        self.show_KK_res.setFont(font)
+        self.show_KK_res.setObjectName("show_KK_res")
         self.show_mag = QtWidgets.QPushButton(self.show_layout)
-        self.show_mag.setGeometry(QtCore.QRect(100, 10, 101, 28))
+        self.show_mag.setGeometry(QtCore.QRect(272, 10, 96, 28))
         font = QtGui.QFont()
         font.setPointSize(9)
         font.setBold(True)
@@ -45,7 +53,7 @@ class Ui_MainWindow(object):
         self.show_mag.setFont(font)
         self.show_mag.setObjectName("show_mag")
         self.show_phase = QtWidgets.QPushButton(self.show_layout)
-        self.show_phase.setGeometry(QtCore.QRect(230, 10, 71, 28))
+        self.show_phase.setGeometry(QtCore.QRect(378, 10, 66, 28))
         font = QtGui.QFont()
         font.setPointSize(9)
         font.setBold(True)
@@ -53,7 +61,7 @@ class Ui_MainWindow(object):
         self.show_phase.setFont(font)
         self.show_phase.setObjectName("show_phase")
         self.show_re = QtWidgets.QPushButton(self.show_layout)
-        self.show_re.setGeometry(QtCore.QRect(320, 10, 81, 28))
+        self.show_re.setGeometry(QtCore.QRect(454, 10, 76, 28))
         font = QtGui.QFont()
         font.setPointSize(9)
         font.setBold(True)
@@ -61,7 +69,7 @@ class Ui_MainWindow(object):
         self.show_re.setFont(font)
         self.show_re.setObjectName("show_re")
         self.show_im = QtWidgets.QPushButton(self.show_layout)
-        self.show_im.setGeometry(QtCore.QRect(420, 10, 71, 28))
+        self.show_im.setGeometry(QtCore.QRect(540, 10, 66, 28))
         font = QtGui.QFont()
         font.setPointSize(9)
         font.setBold(True)
@@ -69,7 +77,7 @@ class Ui_MainWindow(object):
         self.show_im.setFont(font)
         self.show_im.setObjectName("show_im")
         self.show_re_res = QtWidgets.QPushButton(self.show_layout)
-        self.show_re_res.setGeometry(QtCore.QRect(510, 10, 101, 28))
+        self.show_re_res.setGeometry(QtCore.QRect(616, 10, 96, 28))
         font = QtGui.QFont()
         font.setPointSize(9)
         font.setBold(True)
@@ -77,7 +85,7 @@ class Ui_MainWindow(object):
         self.show_re_res.setFont(font)
         self.show_re_res.setObjectName("show_re_res")
         self.show_im_res = QtWidgets.QPushButton(self.show_layout)
-        self.show_im_res.setGeometry(QtCore.QRect(630, 10, 101, 28))
+        self.show_im_res.setGeometry(QtCore.QRect(722, 10, 96, 28))
         font = QtGui.QFont()
         font.setPointSize(9)
         font.setBold(True)
@@ -85,7 +93,7 @@ class Ui_MainWindow(object):
         self.show_im_res.setFont(font)
         self.show_im_res.setObjectName("show_im_res")
         self.show_DRT = QtWidgets.QPushButton(self.show_layout)
-        self.show_DRT.setGeometry(QtCore.QRect(750, 10, 51, 28))
+        self.show_DRT.setGeometry(QtCore.QRect(828, 10, 56, 28))
         font = QtGui.QFont()
         font.setPointSize(9)
         font.setBold(True)
@@ -93,15 +101,31 @@ class Ui_MainWindow(object):
         self.show_DRT.setFont(font)
         self.show_DRT.setObjectName("show_DRT")
         self.show_score = QtWidgets.QPushButton(self.show_layout)
-        self.show_score.setGeometry(QtCore.QRect(820, 10, 81, 28))
+        self.show_score.setGeometry(QtCore.QRect(894, 10, 76, 28))
         font = QtGui.QFont()
         font.setPointSize(9)
         font.setBold(True)
         font.setWeight(75)
         self.show_score.setFont(font)
         self.show_score.setObjectName("show_score")
+        self.show_DRT_comp = QtWidgets.QPushButton(self.show_layout)
+        self.show_DRT_comp.setGeometry(QtCore.QRect(980, 10, 127, 28))
+        font = QtGui.QFont()
+        font.setPointSize(9)
+        font.setBold(True)
+        font.setWeight(75)
+        self.show_DRT_comp.setFont(font)
+        self.show_DRT_comp.setObjectName("show_DRT_comp")
+        self.show_DRT_map = QtWidgets.QPushButton(self.show_layout)
+        self.show_DRT_map.setGeometry(QtCore.QRect(980, 10, 127, 28))
+        font = QtGui.QFont()
+        font.setPointSize(9)
+        font.setBold(True)
+        font.setWeight(75)
+        self.show_DRT_map.setFont(font)
+        self.show_DRT_map.setObjectName("show_DRT_map")
         self.General_frame = QtWidgets.QFrame(self.centralwidget)
-        self.General_frame.setGeometry(QtCore.QRect(10, 10, 311, 931))
+        self.General_frame.setGeometry(QtCore.QRect(10, 10, 311, 1000))
         self.General_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
         self.General_frame.setFrameShadow(QtWidgets.QFrame.Raised)
         self.General_frame.setObjectName("General_frame")
@@ -113,12 +137,7 @@ class Ui_MainWindow(object):
         font.setWeight(50)
         self.settings_layout.setFont(font)
         self.settings_layout.setAutoFillBackground(False)
-        self.settings_layout.setStyleSheet("QGroupBox\n"
-"{\n"
-"border : 2px solid;\n"
-"border-color: black;\n"
-"\n"
-"}")
+        self.settings_layout.setStyleSheet("")
         self.settings_layout.setObjectName("settings_layout")
         self.import_button = QtWidgets.QPushButton(self.settings_layout)
         self.import_button.setGeometry(QtCore.QRect(90, 40, 161, 28))
@@ -286,12 +305,7 @@ class Ui_MainWindow(object):
         font.setBold(False)
         font.setWeight(50)
         self.RBF_frame.setFont(font)
-        self.RBF_frame.setStyleSheet("QGroupBox\n"
-"{\n"
-"border : 2px solid;\n"
-"border-color: black;\n"
-"\n"
-"}")
+        self.RBF_frame.setStyleSheet("")
         self.RBF_frame.setObjectName("RBF_frame")
         self.run_frame = QtWidgets.QGroupBox(self.RBF_frame)
         self.run_frame.setGeometry(QtCore.QRect(-10, 120, 271, 271))
@@ -330,20 +344,86 @@ class Ui_MainWindow(object):
         self.shape_control_choice.setObjectName("shape_control_choice")
         self.shape_control_choice.addItem("")
         self.shape_control_choice.addItem("")
+        self.KK_frame = QtWidgets.QGroupBox(self.General_frame)
+        self.KK_frame.setGeometry(QtCore.QRect(10, 590, 281, 151))
+        font = QtGui.QFont()
+        font.setPointSize(10)
+        font.setBold(False)
+        font.setWeight(50)
+        self.KK_frame.setFont(font)
+        self.KK_frame.setStyleSheet("")
+        self.KK_frame.setObjectName("KK_frame")
+        self.cutoff_label = QtWidgets.QLabel(self.KK_frame)
+        self.cutoff_label.setGeometry(QtCore.QRect(10, 20, 101, 16))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        font.setBold(True)
+        font.setWeight(75)
+        self.cutoff_label.setFont(font)
+        self.cutoff_label.setObjectName("cutoff_label")
+        self.cutoff_entry = QtWidgets.QLineEdit(self.KK_frame)
+        self.cutoff_entry.setGeometry(QtCore.QRect(140, 10, 111, 21))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        self.cutoff_entry.setFont(font)
+        self.cutoff_entry.setObjectName("cutoff_entry")
+        self.max_elements_label = QtWidgets.QLabel(self.KK_frame)
+        self.max_elements_label.setGeometry(QtCore.QRect(10, 50, 121, 16))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        font.setBold(True)
+        font.setWeight(75)
+        self.max_elements_label.setFont(font)
+        self.max_elements_label.setObjectName("max_elements_label")
+        self.max_elements_entry = QtWidgets.QLineEdit(self.KK_frame)
+        self.max_elements_entry.setGeometry(QtCore.QRect(140, 40, 111, 21))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        self.max_elements_entry.setFont(font)
+        self.max_elements_entry.setObjectName("max_elements_entry")
+        self.fit_type_label = QtWidgets.QLabel(self.KK_frame)
+        self.fit_type_label.setGeometry(QtCore.QRect(10, 80, 101, 16))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        font.setBold(True)
+        font.setWeight(75)
+        self.fit_type_label.setFont(font)
+        self.fit_type_label.setObjectName("fit_type_label")
+        self.fit_type_choice = QtWidgets.QComboBox(self.KK_frame)
+        self.fit_type_choice.setGeometry(QtCore.QRect(140, 70, 111, 21))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        self.fit_type_choice.setFont(font)
+        self.fit_type_choice.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.fit_type_choice.setMinimumContentsLength(1)
+        self.fit_type_choice.setObjectName("fit_type_choice")
+        self.fit_type_choice.addItem("")
+        self.fit_type_choice.addItem("")
+        self.fit_type_choice.addItem("")
+        self.fit_type_choice.setCurrentIndex(2)
+        self.analyze_kkr_label = QtWidgets.QLabel(self.KK_frame)
+        self.analyze_kkr_label.setGeometry(QtCore.QRect(10, 110, 121, 16))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        font.setBold(True)
+        font.setWeight(75)
+        self.analyze_kkr_label.setFont(font)
+        self.analyze_kkr_label.setObjectName("analyze_kkr_label")
+        self.run_kkr_button = QtWidgets.QPushButton(self.KK_frame)
+        self.run_kkr_button.setGeometry(QtCore.QRect(170, 100, 81, 21))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        self.run_kkr_button.setFont(font)
+        self.run_kkr_button.setObjectName("run_kkr_button")
         self.run_layout = QtWidgets.QGroupBox(self.General_frame)
-        self.run_layout.setGeometry(QtCore.QRect(10, 590, 281, 101))
+        self.run_layout.setGeometry(QtCore.QRect(10, 750, 281, 151))
         font = QtGui.QFont()
         font.setPointSize(10)
         font.setBold(False)
         font.setWeight(50)
         self.run_layout.setFont(font)
         self.run_layout.setTabletTracking(True)
-        self.run_layout.setStyleSheet("QGroupBox\n"
-"{\n"
-"border : 2px solid;\n"
-"border-color: black;\n"
-"\n"
-"}")
+        self.run_layout.setStyleSheet("")
         self.run_layout.setObjectName("run_layout")
         self.simple_run_button = QtWidgets.QPushButton(self.run_layout)
         self.simple_run_button.setGeometry(QtCore.QRect(170, 10, 81, 21))
@@ -387,19 +467,26 @@ class Ui_MainWindow(object):
         font.setPointSize(8)
         self.HT_button.setFont(font)
         self.HT_button.setObjectName("HT_button")
+        self.fit_one_button = QtWidgets.QPushButton(self.run_layout)
+        self.fit_one_button.setGeometry(QtCore.QRect(10, 100, 81, 21))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        self.fit_one_button.setFont(font)
+        self.fit_one_button.setObjectName("fit_one_button")
+        self.fit_all_button = QtWidgets.QPushButton(self.run_layout)
+        self.fit_all_button.setGeometry(QtCore.QRect(170, 100, 81, 21))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        self.fit_all_button.setFont(font)
+        self.fit_all_button.setObjectName("fit_all_button")
         self.Peak_analysis_frame = QtWidgets.QGroupBox(self.General_frame)
-        self.Peak_analysis_frame.setGeometry(QtCore.QRect(10, 700, 281, 111))
+        self.Peak_analysis_frame.setGeometry(QtCore.QRect(10, 910, 281, 111))
         font = QtGui.QFont()
         font.setPointSize(10)
         font.setBold(False)
         font.setWeight(50)
         self.Peak_analysis_frame.setFont(font)
-        self.Peak_analysis_frame.setStyleSheet("QGroupBox\n"
-"{\n"
-"border : 2px solid;\n"
-"border-color: black;\n"
-"\n"
-"}")
+        self.Peak_analysis_frame.setStyleSheet("")
         self.Peak_analysis_frame.setObjectName("Peak_analysis_frame")
         self.run_frame_2 = QtWidgets.QGroupBox(self.Peak_analysis_frame)
         self.run_frame_2.setGeometry(QtCore.QRect(-10, 120, 271, 271))
@@ -453,18 +540,13 @@ class Ui_MainWindow(object):
         self.peak_method_choice.addItem("")
         self.peak_method_choice.addItem("")
         self.export_frame = QtWidgets.QGroupBox(self.General_frame)
-        self.export_frame.setGeometry(QtCore.QRect(10, 820, 281, 111))
+        self.export_frame.setGeometry(QtCore.QRect(10, 1030, 281, 111))
         font = QtGui.QFont()
         font.setPointSize(10)
         font.setBold(False)
         font.setWeight(50)
         self.export_frame.setFont(font)
-        self.export_frame.setStyleSheet("QGroupBox\n"
-"{\n"
-"border : 2px solid;\n"
-"border-color: black;\n"
-"\n"
-"}")
+        self.export_frame.setStyleSheet("")
         self.export_frame.setObjectName("export_frame")
         self.export_DRT_label = QtWidgets.QLabel(self.export_frame)
         self.export_DRT_label.setGeometry(QtCore.QRect(10, 30, 41, 16))
@@ -508,6 +590,32 @@ class Ui_MainWindow(object):
         font.setPointSize(8)
         self.export_fig_button.setFont(font)
         self.export_fig_button.setObjectName("export_fig_button")
+
+        # --- Files panel (right sidebar) ---
+        self.Files_frame = QtWidgets.QFrame(self.centralwidget)
+        self.Files_frame.setGeometry(QtCore.QRect(1250, 10, 365, 1000))
+        self.Files_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.Files_frame.setFrameShadow(QtWidgets.QFrame.Raised)
+        self.Files_frame.setStyleSheet("border: 0px;")
+        self.Files_frame.setObjectName("Files_frame")
+        self.files_layout = QtWidgets.QGroupBox(self.Files_frame)
+        self.files_layout.setGeometry(QtCore.QRect(10, 0, 345, 960))
+        font = QtGui.QFont()
+        font.setPointSize(10)
+        font.setBold(False)
+        font.setWeight(50)
+        self.files_layout.setFont(font)
+        self.files_layout.setObjectName("files_layout")
+        self.files_list = QtWidgets.QListWidget(self.files_layout)
+        self.files_list.setGeometry(QtCore.QRect(10, 30, 325, 920))
+        self.files_list.setObjectName("files_list")
+        self.files_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.files_list.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
+        self.files_list.setDefaultDropAction(QtCore.Qt.MoveAction)
+        self.files_list.setDragEnabled(True)
+        self.files_list.setAcceptDrops(True)
+        self.files_list.setDropIndicatorShown(True)
+
         MainWindow.setCentralWidget(self.centralwidget)
         self.menubar = QtWidgets.QMenuBar(MainWindow)
         self.menubar.setGeometry(QtCore.QRect(0, 0, 1625, 26))
@@ -525,12 +633,103 @@ class Ui_MainWindow(object):
         self.lambda_choice.setCurrentIndex(0)
         self.shape_control_choice.setCurrentIndex(0)
         self.peak_method_choice.setCurrentIndex(0)
+        self._apply_responsive_shell()
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
+
+    def _clear_widget_layout(self, widget):
+        lay = widget.layout()
+        if lay is None:
+            return
+        while lay.count():
+            item = lay.takeAt(0)
+            child_widget = item.widget()
+            if child_widget is not None:
+                child_widget.setParent(widget)
+        QtWidgets.QWidget().setLayout(lay)
+
+    def _apply_responsive_shell(self):
+        self.centralwidget.setContentsMargins(0, 0, 0, 0)
+
+        self.General_frame.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.General_frame.setFrameShadow(QtWidgets.QFrame.Plain)
+        self.General_frame.setStyleSheet("""
+        QFrame#General_frame {
+            border: 0px;
+            background: transparent;
+        }
+        """)
+
+        self.General_frame.setMinimumWidth(240)
+        self.General_frame.setMaximumWidth(520)
+        self.General_frame.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
+
+        self.frame.setMinimumWidth(240)
+        self.frame.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+        self.Files_frame.setMinimumWidth(180)
+        self.Files_frame.setMaximumWidth(420)
+        self.Files_frame.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
+
+        self.show_layout.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.show_layout.setMinimumHeight(52)
+        self.show_layout.setMaximumHeight(72)
+        self.plot_panel.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+        self.files_layout.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.files_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+        for gb in [self.settings_layout, self.RBF_frame, self.KK_frame, self.run_layout, self.Peak_analysis_frame,
+                   self.export_frame]:
+            gb.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+
+        self._clear_widget_layout(self.centralwidget)
+        self._clear_widget_layout(self.frame)
+        self._clear_widget_layout(self.Files_frame)
+        self._clear_widget_layout(self.files_layout)
+        self._clear_widget_layout(self.General_frame)
+
+        root = QtWidgets.QHBoxLayout(self.centralwidget)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(0)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self.centralwidget)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self.General_frame)
+        splitter.addWidget(self.frame)
+        splitter.addWidget(self.Files_frame)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([300, 900, 220])
+
+        root.addWidget(splitter)
+
+        left_layout = QtWidgets.QVBoxLayout(self.General_frame)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
+        left_layout.addStretch(1)
+
+        center_layout = QtWidgets.QVBoxLayout(self.frame)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(8)
+        center_layout.addWidget(self.show_layout, 0)
+        center_layout.addWidget(self.plot_panel, 1)
+
+        files_outer = QtWidgets.QVBoxLayout(self.Files_frame)
+        files_outer.setContentsMargins(0, 0, 0, 0)
+        files_outer.setSpacing(0)
+        files_outer.addWidget(self.files_layout, 1)
+
+        files_inner = QtWidgets.QVBoxLayout(self.files_layout)
+        files_inner.setContentsMargins(10, 10, 10, 10)
+        files_inner.setSpacing(8)
+        files_inner.addWidget(self.files_list, 1)
 
     def retranslateUi(self, MainWindow):
         _translate = QtCore.QCoreApplication.translate
-        MainWindow.setWindowTitle(_translate("MainWindow", "pyDRTtools"))
+        MainWindow.setWindowTitle(_translate("MainWindow", "SuperDRTtools"))
         self.show_EIS.setText(_translate("MainWindow", "EIS Data"))
+        self.show_KK_res.setText(_translate("MainWindow", "K-K Residual"))
         self.show_mag.setText(_translate("MainWindow", "Magnitude"))
         self.show_phase.setText(_translate("MainWindow", "Phase"))
         self.show_re.setText(_translate("MainWindow", "Re Part"))
@@ -539,8 +738,11 @@ class Ui_MainWindow(object):
         self.show_im_res.setText(_translate("MainWindow", "Im Residual"))
         self.show_DRT.setText(_translate("MainWindow", "DRT"))
         self.show_score.setText(_translate("MainWindow", "EIS Score"))
+        self.show_DRT_comp.setText(_translate("MainWindow", "DRT comparison"))
+        self.show_DRT_map.setText(_translate("MainWindow", "DRT Map"))
         self.settings_layout.setTitle(_translate("MainWindow", "Settings"))
-        self.import_button.setText(_translate("MainWindow", "Import "))
+        self.files_layout.setTitle(_translate("MainWindow", "Files"))
+        self.import_button.setText(_translate("MainWindow", "Import File(s)"))
         self.discre_label.setText(_translate("MainWindow", "Method of Discretization"))
         self.discre_choice.setCurrentText(_translate("MainWindow", "Gaussian"))
         self.discre_choice.setItemText(0, _translate("MainWindow", "Gaussian"))
@@ -591,13 +793,26 @@ class Ui_MainWindow(object):
         self.shape_control_choice.setCurrentText(_translate("MainWindow", "FWHM Coefficient"))
         self.shape_control_choice.setItemText(0, _translate("MainWindow", "FWHM Coefficient"))
         self.shape_control_choice.setItemText(1, _translate("MainWindow", "Shape Factor"))
+        self.KK_frame.setTitle(_translate("MainWindow", "K-K relations"))
+        self.cutoff_label.setText(_translate("MainWindow", "Cut Off"))
+        self.cutoff_entry.setText(_translate("MainWindow", "0.5"))
+        self.max_elements_label.setText(_translate("MainWindow", "MAX Elements"))
+        self.max_elements_entry.setText(_translate("MainWindow", "50"))
+        self.fit_type_label.setText(_translate("MainWindow", "Fit Type"))
+        self.fit_type_choice.setItemText(0, _translate("MainWindow", "real"))
+        self.fit_type_choice.setItemText(1, _translate("MainWindow", "imag"))
+        self.fit_type_choice.setItemText(2, _translate("MainWindow", "complex"))
+        self.analyze_kkr_label.setText(_translate("MainWindow", "Analyze KKR"))
+        self.run_kkr_button.setText(_translate("MainWindow", "Run"))
         self.run_layout.setTitle(_translate("MainWindow", "Run"))
-        self.simple_run_button.setText(_translate("MainWindow", "Run"))
+        self.simple_run_button.setText(_translate("MainWindow", "Select"))
         self.simple_run_label.setText(_translate("MainWindow", "Simple Run"))
         self.bayes_label.setText(_translate("MainWindow", "Bayesian Run"))
         self.HT_label.setText(_translate("MainWindow", "Hilbert Transform"))
-        self.bayesian_button.setText(_translate("MainWindow", "Run"))
-        self.HT_button.setText(_translate("MainWindow", "Run"))
+        self.bayesian_button.setText(_translate("MainWindow", "Select"))
+        self.HT_button.setText(_translate("MainWindow", "Select"))
+        self.fit_one_button.setText(_translate("MainWindow", "Fit One"))
+        self.fit_all_button.setText(_translate("MainWindow", "Fit All"))
         self.Peak_analysis_frame.setTitle(_translate("MainWindow", "Peak Analysis "))
         self.run_frame_2.setTitle(_translate("MainWindow", "Options for RBF"))
         self.Peak_decon_run.setText(_translate("MainWindow", "Peak deconvolution"))
@@ -615,7 +830,6 @@ class Ui_MainWindow(object):
         self.export_DRT_button.setText(_translate("MainWindow", "Export"))
         self.export_EIS_button.setText(_translate("MainWindow", "Export"))
         self.export_fig_button.setText(_translate("MainWindow", "Save"))
-        
 
 
 # if __name__ == "__main__":
@@ -629,6 +843,7 @@ class Ui_MainWindow(object):
 
 if __name__ == "__main__":
     import sys
+
     # Enable high DPI scaling (already done)
     QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
     # Use high DPI icons (already done)
@@ -645,7 +860,7 @@ if __name__ == "__main__":
     # Apply a custom scaling factor based on detected DPI
     if scaling_factor > 1:
         app.setStyleSheet(f"font-size: {12 * scaling_factor}px;")
-    
+
     MainWindow = QtWidgets.QMainWindow()
     ui = Ui_MainWindow()
     ui.setupUi(MainWindow)
