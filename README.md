@@ -235,22 +235,7 @@ You can package SuperDRTtools into a Windows executable using **PyInstaller**.
 ### Basic command
 
 ```bash
-python -m PyInstaller --noconfirm --clean --windowed --onefile --name SuperDRTtools launch.py
-```
-
-### Notes
-
-- Use `python -m PyInstaller`
-- If the packaged EXE reports missing hidden imports, add `--hidden-import` or `--collect-submodules` as needed.
-- During debugging, you may temporarily remove `--windowed` to see console traceback output.
-
-### Example with hidden-import fixes
-
-```bash
-python -m PyInstaller --noconfirm --clean --windowed --onefile --name SuperDRTtools \
-  --hidden-import=sklearn.externals.array_api_compat.numpy.fft \
-  --collect-submodules=sklearn.externals.array_api_compat.numpy \
-  launch.py
+python -m PyInstaller --noconfirm --clean --windowed --add-data "launchImg/launch.png;launchImg" --splash launchImg\launch.png --onefile --name SuperDRTtools launch.py
 ```
 
 ---

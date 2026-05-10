@@ -5,13 +5,10 @@ __date__ = '4th October 2024'
 
 import csv
 import os
-import sys
 import copy
-import re
 from contextlib import nullcontext
 
-import numpy as np
-from numpy import absolute, angle, log10
+from numpy import absolute, angle
 from PyQt5 import QtGui, QtWidgets, QtCore
 
 # --- Parallel fitting performance notes ---
@@ -36,8 +33,7 @@ def _native_thread_limit_ctx(n_threads: int):
         return nullcontext()
 
 
-def apply_macos_flat_theme(app: QtWidgets.QApplication) -> None:
-    """Flat, light, macOS-like theme (white/gray) + Arial font."""
+def apply_flat_theme(app: QtWidgets.QApplication) -> None:
     try:
         app.setStyle("Fusion")
     except Exception:
@@ -139,8 +135,6 @@ def apply_macos_flat_theme(app: QtWidgets.QApplication) -> None:
 
     QScrollArea { border: 0px; background: transparent; }
 
-
-/* Scrollbars (macOS-like) */
 QScrollBar:vertical {
     background: transparent;
     width: 10px;
@@ -1221,27 +1215,30 @@ class GUI(QtWidgets.QMainWindow):
         form.addRow('K-K residual > (%)', thr_edit)
         root.addWidget(form_widget)
 
-        utility_row = QtWidgets.QHBoxLayout()
-        utility_row.setSpacing(8)
-        clear_auto_btn = QtWidgets.QPushButton('Clear Current Auto Mask', dlg)
-        clear_auto_all_btn = QtWidgets.QPushButton('Clear All Auto Masks', dlg)
-        utility_row.addWidget(clear_auto_btn)
-        utility_row.addWidget(clear_auto_all_btn)
-        utility_row.addStretch(1)
-        root.addLayout(utility_row)
+        button_grid = QtWidgets.QGridLayout()
+        button_grid.setHorizontalSpacing(8)
+        button_grid.setVerticalSpacing(8)
 
-        button_row = QtWidgets.QHBoxLayout()
-        button_row.setSpacing(8)
-        button_row.addStretch(1)
-        cancel_btn = QtWidgets.QPushButton('Cancel', dlg)
-        apply_btn = QtWidgets.QPushButton('Apply', dlg)
+        clear_auto_btn = QtWidgets.QPushButton('Clear Current File Auto Mask', dlg)
+        clear_auto_all_btn = QtWidgets.QPushButton('Clear All Files Auto Masks', dlg)
+        apply_btn = QtWidgets.QPushButton('Apply to This File', dlg)
         apply_all_btn = QtWidgets.QPushButton('Apply to All Files', dlg)
+
         apply_btn.setDefault(True)
         apply_btn.setAutoDefault(True)
-        button_row.addWidget(cancel_btn)
-        button_row.addWidget(apply_btn)
-        button_row.addWidget(apply_all_btn)
-        root.addLayout(button_row)
+
+        # 让四个按钮宽度一致，上下更整齐
+        for btn in (clear_auto_btn, clear_auto_all_btn, apply_btn, apply_all_btn):
+            btn.setMinimumWidth(170)
+            btn.setMinimumHeight(32)
+
+        # 两排两列，上下对齐
+        button_grid.addWidget(clear_auto_btn, 0, 0)
+        button_grid.addWidget(clear_auto_all_btn, 0, 1)
+        button_grid.addWidget(apply_btn, 1, 0)
+        button_grid.addWidget(apply_all_btn, 1, 1)
+
+        root.addLayout(button_grid)
 
         def _parse_optional(edit):
             s = (edit.text() or '').strip()
@@ -1292,7 +1289,6 @@ class GUI(QtWidgets.QMainWindow):
             self._clear_auto_mask_for_keys(self._get_file_keys_in_ui_order())
             dlg.accept()
 
-        cancel_btn.clicked.connect(dlg.reject)
         apply_btn.clicked.connect(_apply_current)
         apply_all_btn.clicked.connect(_apply_all)
         clear_auto_btn.clicked.connect(_clear_current)
@@ -1321,6 +1317,12 @@ class GUI(QtWidgets.QMainWindow):
     def _apply_eis_selection_highlight(self, fig):
         if fig is None:
             return
+
+        ax = fig.axes
+        old_xlim = ax.get_xlim()
+        old_ylim = ax.get_ylim()
+        old_autoscale = ax.get_autoscale_on()
+
         for artist in getattr(fig, '_eis_selection_artists', []):
             try:
                 artist.remove()
@@ -1329,41 +1331,33 @@ class GUI(QtWidgets.QMainWindow):
         fig._eis_selection_artists = []
 
         payload = getattr(fig, '_eis_plot_payload', None)
-        if not payload:
-            try:
-                fig.draw_idle()
-            except Exception:
-                fig.draw()
-            return
+        if payload:
+            selected = np.asarray(getattr(self, '_eis_selected_raw_indices', []), dtype=int).reshape(-1)
+            raw_indices = np.asarray(payload.get('raw_indices', []), dtype=int).reshape(-1)
+            xs = np.asarray(payload.get('x', []), dtype=float).reshape(-1)
+            ys = np.asarray(payload.get('y', []), dtype=float).reshape(-1)
 
-        selected = np.asarray(getattr(self, '_eis_selected_raw_indices', []), dtype=int).reshape(-1)
-        if selected.size == 0:
-            try:
-                fig.draw_idle()
-            except Exception:
-                fig.draw()
-            return
+            if selected.size > 0 and raw_indices.size > 0 and xs.size == raw_indices.size and ys.size == raw_indices.size:
+                keep = np.isin(raw_indices, selected)
+                if np.any(keep):
+                    artist = ax.scatter(
+                        xs[keep], ys[keep],
+                        s=95, facecolors='none',
+                        edgecolors='#00B5FF',
+                        linewidths=1.5, zorder=30
+                    )
+                    fig._eis_selection_artists = [artist]
 
-        raw_indices = np.asarray(payload.get('raw_indices', []), dtype=int).reshape(-1)
-        xs = np.asarray(payload.get('x', []), dtype=float).reshape(-1)
-        ys = np.asarray(payload.get('y', []), dtype=float).reshape(-1)
-        if raw_indices.size == 0 or xs.size != raw_indices.size or ys.size != raw_indices.size:
-            try:
-                fig.draw_idle()
-            except Exception:
-                fig.draw()
-            return
-
-        keep = np.isin(raw_indices, selected)
-        if np.any(keep):
-            artist = fig.axes.scatter(xs[keep], ys[keep], s=95, facecolors='none',
-                                      edgecolors='#00B5FF', linewidths=1.5, zorder=30)
-            fig._eis_selection_artists = [artist]
+        ax.set_autoscale_on(False)
+        ax.set_xlim(old_xlim)
+        ax.set_ylim(old_ylim)
 
         try:
             fig.draw_idle()
         except Exception:
             fig.draw()
+
+        ax.set_autoscale_on(old_autoscale)
 
     def _on_eis_box_select(self, eclick, erelease):
         fig = getattr(self, '_eis_canvas', None)
@@ -4353,7 +4347,7 @@ def _rebuild_sidebar_with_forms(self) -> None:
 
     scroll.setWidget(container)
 
-    host.setMinimumWidth(450)
+    host.setMinimumWidth(400)
     host.setMaximumWidth(600)
     host.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
 
@@ -4388,44 +4382,90 @@ def _layout_settings_group(self) -> None:
     _set_label_style_clean(gb)
     _clear_layout_widget(gb)
 
-    form = QtWidgets.QFormLayout(gb)
-    form.setContentsMargins(16, 10, 16, 14)
-    form.setHorizontalSpacing(16)
-    form.setVerticalSpacing(10)
-    form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-    form.setFormAlignment(QtCore.Qt.AlignTop)
-    form.setRowWrapPolicy(QtWidgets.QFormLayout.DontWrapRows)
-    form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+    grid = QtWidgets.QGridLayout(gb)
+    grid.setContentsMargins(16, 10, 16, 14)
+    grid.setHorizontalSpacing(16)
+    grid.setVerticalSpacing(10)
 
-    for w in [
-        self.ui.discre_choice, self.ui.data_used_choice, self.ui.induct_choice, self.ui.der_choice,
-        self.ui.lambda_choice, self.ui.reg_param_entry, self.ui.reg_param_entry_2, self.ui.sample_no_entry
-    ]:
+    grid.setColumnStretch(0, 1)
+    grid.setColumnStretch(1, 1)
+
+    labels = [
+        self.ui.import_label,
+        self.ui.discre_label,
+        self.ui.data_used_label,
+        self.ui.induct_label,
+        self.ui.der_label,
+        self.ui.lambda_choice_label,
+        self.ui.reg_param_label,
+        self.ui.reg_param_label_2,
+        self.ui.sample_no,
+    ]
+
+    for lab in labels:
+        lab.setMinimumWidth(120)
+        lab.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        lab.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+    fields = [
+        self.ui.discre_choice,
+        self.ui.data_used_choice,
+        self.ui.induct_choice,
+        self.ui.der_choice,
+        self.ui.lambda_choice,
+        self.ui.reg_param_entry,
+        self.ui.reg_param_entry_2,
+        self.ui.sample_no_entry,
+    ]
+    for w in fields:
         w.setMinimumHeight(30)
-        _ensure_field_width(w)
+        w.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
-    self.ui.import_button.setMinimumHeight(30)
-    self.ui.import_button.setMinimumWidth(120)
+    self.ui.import_button.setFixedHeight(30)
+    self.ui.import_button.setFixedWidth(120)
+    self.ui.import_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
+    keep = set(labels)
+    _hide_unmanaged_children(gb, keep)
+
+    row = 0
     import_row = QtWidgets.QHBoxLayout()
     import_row.addStretch(1)
     import_row.addWidget(self.ui.import_button)
+    grid.addWidget(self.ui.import_label, 0, 0)
+    grid.addLayout(import_row, 0, 1)
+    row += 1
 
-    keep = {
-        self.ui.import_label, self.ui.discre_label, self.ui.data_used_label, self.ui.induct_label, self.ui.der_label,
-        self.ui.lambda_choice_label, self.ui.reg_param_label, self.ui.reg_param_label_2, self.ui.sample_no
-    }
-    _hide_unmanaged_children(gb, keep)
+    grid.addWidget(self.ui.discre_label, row, 0)
+    grid.addWidget(self.ui.discre_choice, row, 1)
+    row += 1
 
-    form.addRow(self.ui.import_label, import_row)
-    form.addRow(self.ui.discre_label, self.ui.discre_choice)
-    form.addRow(self.ui.data_used_label, self.ui.data_used_choice)
-    form.addRow(self.ui.induct_label, self.ui.induct_choice)
-    form.addRow(self.ui.der_label, self.ui.der_choice)
-    form.addRow(self.ui.lambda_choice_label, self.ui.lambda_choice)
-    form.addRow(self.ui.reg_param_label, self.ui.reg_param_entry)
-    form.addRow(self.ui.reg_param_label_2, self.ui.reg_param_entry_2)
-    form.addRow(self.ui.sample_no, self.ui.sample_no_entry)
+    grid.addWidget(self.ui.data_used_label, row, 0)
+    grid.addWidget(self.ui.data_used_choice, row, 1)
+    row += 1
+
+    grid.addWidget(self.ui.induct_label, row, 0)
+    grid.addWidget(self.ui.induct_choice, row, 1)
+    row += 1
+
+    grid.addWidget(self.ui.der_label, row, 0)
+    grid.addWidget(self.ui.der_choice, row, 1)
+    row += 1
+
+    grid.addWidget(self.ui.lambda_choice_label, row, 0)
+    grid.addWidget(self.ui.lambda_choice, row, 1)
+    row += 1
+
+    grid.addWidget(self.ui.reg_param_label, row, 0)
+    grid.addWidget(self.ui.reg_param_entry, row, 1)
+    row += 1
+
+    grid.addWidget(self.ui.reg_param_label_2, row, 0)
+    grid.addWidget(self.ui.reg_param_entry_2, row, 1)
+    row += 1
+
+    grid.addWidget(self.ui.sample_no, row, 0)
+    grid.addWidget(self.ui.sample_no_entry, row, 1)
 
 
 def _layout_rbf_group(self) -> None:
@@ -4433,21 +4473,27 @@ def _layout_rbf_group(self) -> None:
     _set_label_style_clean(gb)
     _clear_layout_widget(gb)
 
-    form = QtWidgets.QFormLayout(gb)
-    form.setContentsMargins(16, 10, 16, 14)
-    form.setHorizontalSpacing(16)
-    form.setVerticalSpacing(10)
-    form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+    grid = QtWidgets.QGridLayout(gb)
+    grid.setContentsMargins(16, 10, 16, 14)
+    grid.setHorizontalSpacing(16)
+    grid.setVerticalSpacing(10)
+    grid.setColumnStretch(0, 1)
+    grid.setColumnStretch(1, 1)
+
+    for lab in [self.ui.shape_control_label, self.ui.FWHM_control_label]:
+        lab.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
 
     for w in [self.ui.shape_control_choice, self.ui.FWHM_entry]:
         w.setMinimumHeight(30)
-        _ensure_field_width(w, min_w=160)
+        w.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
     keep = {self.ui.shape_control_label, self.ui.FWHM_control_label}
     _hide_unmanaged_children(gb, keep)
 
-    form.addRow(self.ui.shape_control_label, self.ui.shape_control_choice)
-    form.addRow(self.ui.FWHM_control_label, self.ui.FWHM_entry)
+    grid.addWidget(self.ui.shape_control_label, 0, 0)
+    grid.addWidget(self.ui.shape_control_choice, 0, 1)
+    grid.addWidget(self.ui.FWHM_control_label, 1, 0)
+    grid.addWidget(self.ui.FWHM_entry, 1, 1)
 
 
 def _layout_kk_group(self) -> None:
@@ -4455,35 +4501,53 @@ def _layout_kk_group(self) -> None:
     _set_label_style_clean(gb)
     _clear_layout_widget(gb)
 
-    form = QtWidgets.QFormLayout(gb)
-    form.setContentsMargins(16, 10, 16, 14)
-    form.setHorizontalSpacing(16)
-    form.setVerticalSpacing(10)
-    form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+    grid = QtWidgets.QGridLayout(gb)
+    grid.setContentsMargins(16, 10, 16, 14)
+    grid.setHorizontalSpacing(16)
+    grid.setVerticalSpacing(10)
+    grid.setColumnStretch(0, 1)
+    grid.setColumnStretch(1, 1)
 
-    self.ui.cutoff_label.setFixedWidth(137)
-    self.ui.max_elements_label.setFixedWidth(137)
-    self.ui.fit_type_label.setFixedWidth(137)
-    self.ui.analyze_kkr_label.setFixedWidth(137)
-    self.ui.run_kkr_button.setFixedHeight(30)
-    self.ui.run_kkr_button.setMinimumWidth(110)
-    self.ui.run_kkr_button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+    for lab in [
+        self.ui.cutoff_label,
+        self.ui.max_elements_label,
+        self.ui.fit_type_label,
+        self.ui.analyze_kkr_label,
+    ]:
+        lab.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
 
     for w in [self.ui.cutoff_entry, self.ui.max_elements_entry, self.ui.fit_type_choice]:
         w.setMinimumHeight(30)
-        _ensure_field_width(w, min_w=160)
+        w.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
-    keep = {self.ui.cutoff_label, self.ui.max_elements_label, self.ui.fit_type_label, self.ui.analyze_kkr_label}
+    self.ui.run_kkr_button.setFixedHeight(30)
+    self.ui.run_kkr_button.setFixedWidth(110)
+    self.ui.run_kkr_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+    keep = {
+        self.ui.cutoff_label,
+        self.ui.max_elements_label,
+        self.ui.fit_type_label,
+        self.ui.analyze_kkr_label,
+    }
     _hide_unmanaged_children(gb, keep)
 
-    form.addRow(self.ui.cutoff_label, self.ui.cutoff_entry)
-    form.addRow(self.ui.max_elements_label, self.ui.max_elements_entry)
-    form.addRow(self.ui.fit_type_label, self.ui.fit_type_choice)
+    grid.addWidget(self.ui.cutoff_label, 0, 0)
+    grid.addWidget(self.ui.cutoff_entry, 0, 1)
+
+    grid.addWidget(self.ui.max_elements_label, 1, 0)
+    grid.addWidget(self.ui.max_elements_entry, 1, 1)
+
+    grid.addWidget(self.ui.fit_type_label, 2, 0)
+    grid.addWidget(self.ui.fit_type_choice, 2, 1)
+
+    grid.addWidget(self.ui.analyze_kkr_label, 3, 0)
 
     btn_row = QtWidgets.QHBoxLayout()
     btn_row.addStretch(1)
     btn_row.addWidget(self.ui.run_kkr_button)
-    form.addRow(self.ui.analyze_kkr_label, btn_row)
+    grid.addWidget(self.ui.analyze_kkr_label, 3, 0)
+    grid.addLayout(btn_row, 3, 1)
 
 
 def _layout_run_group(self) -> None:
@@ -4534,30 +4598,46 @@ def _layout_peak_group(self) -> None:
     _set_label_style_clean(gb)
     _clear_layout_widget(gb)
 
-    form = QtWidgets.QFormLayout(gb)
-    form.setContentsMargins(16, 10, 16, 14)
-    form.setHorizontalSpacing(16)
-    form.setVerticalSpacing(10)
-    form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+    grid = QtWidgets.QGridLayout(gb)
+    grid.setContentsMargins(16, 10, 16, 14)
+    grid.setHorizontalSpacing(16)
+    grid.setVerticalSpacing(10)
+
+    grid.setColumnStretch(0, 1)
+    grid.setColumnStretch(1, 1)
+
+    for lab in [self.ui.peak_method_label, self.ui.reg_param_2, self.ui.Peak_decon_run]:
+        lab.setMinimumWidth(150)
+        lab.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
+        lab.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
 
     self.ui.peak_method_choice.setMinimumHeight(30)
-    _ensure_field_width(self.ui.peak_method_choice)
-    self.ui.peak_num_entry.setMinimumHeight(30)
-    _ensure_field_width(self.ui.peak_num_entry)
+    self.ui.peak_method_choice.setMinimumWidth(110)
+    self.ui.peak_method_choice.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
-    self.ui.peak_decon_button.setMinimumHeight(30)
-    self.ui.peak_decon_button.setMinimumWidth(110)
+    self.ui.peak_num_entry.setMinimumHeight(30)
+    self.ui.peak_num_entry.setMinimumWidth(110)
+    self.ui.peak_num_entry.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+    self.ui.peak_decon_button.setFixedHeight(30)
+    self.ui.peak_decon_button.setFixedWidth(110)
+    self.ui.peak_decon_button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
 
     keep = {self.ui.peak_method_label, self.ui.reg_param_2, self.ui.Peak_decon_run}
     _hide_unmanaged_children(gb, keep)
 
-    form.addRow(self.ui.peak_method_label, self.ui.peak_method_choice)
-    form.addRow(self.ui.reg_param_2, self.ui.peak_num_entry)
+    grid.addWidget(self.ui.peak_method_label, 0, 0)
+    grid.addWidget(self.ui.peak_method_choice, 0, 1)
+
+    grid.addWidget(self.ui.reg_param_2, 1, 0)
+    grid.addWidget(self.ui.peak_num_entry, 1, 1)
 
     btn_row = QtWidgets.QHBoxLayout()
     btn_row.addStretch(1)
     btn_row.addWidget(self.ui.peak_decon_button)
-    form.addRow(self.ui.Peak_decon_run, btn_row)
+
+    grid.addWidget(self.ui.Peak_decon_run, 2, 0)
+    grid.addLayout(btn_row, 2, 1)
 
 
 def _layout_export_group(self) -> None:
@@ -4688,7 +4768,7 @@ def launch_gui():
 
     app = QtWidgets.QApplication([])
     try:
-        apply_macos_flat_theme(app)
+        apply_flat_theme(app)
     except Exception:
         pass
 
