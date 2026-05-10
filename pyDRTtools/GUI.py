@@ -6,6 +6,7 @@ __date__ = '4th October 2024'
 import csv
 import os
 import copy
+import hashlib
 from contextlib import nullcontext
 
 from numpy import absolute, angle
@@ -539,7 +540,7 @@ def _clear_kk_results(entry):
     for attr in (
             'kk_valid', 'kk_c', 'kk_max_m', 'kk_fit_type', 'kk_selected_m', 'kk_mu', 'kk_tau',
             'kk_R0', 'kk_R', 'kk_L', 'kk_Z_fit', 'kk_res_re_pct', 'kk_res_im_pct',
-            'kk_res_re_raw_pct', 'kk_res_im_raw_pct', 'kk_Z_fit_raw'
+            'kk_res_re_raw_pct', 'kk_res_im_raw_pct', 'kk_Z_fit_raw', 'kk_signature'
     ):
         try:
             if hasattr(entry, attr):
@@ -606,6 +607,7 @@ def _run_lin_kk(entry, c: float = 0.85, max_m: int = 50, fit_type: str = 'comple
     entry.kk_c = c
     entry.kk_max_m = max_m
     entry.kk_fit_type = fit_type
+    entry.kk_signature = _build_kk_signature(entry, c=c, max_m=max_m, fit_type=fit_type)
     entry.kk_selected_m = int(M)
     entry.kk_mu = float(mu)
     entry.kk_Z_fit = np.asarray(Z_fit, dtype=complex)
@@ -660,8 +662,80 @@ def _refresh_kk_current_arrays(entry):
     return entry
 
 
+
+def _array_signature_digest(values, dtype=None):
+    """Return a compact, stable digest for a NumPy-compatible array."""
+    try:
+        arr = np.asarray(values, dtype=dtype).reshape(-1)
+        arr = np.ascontiguousarray(arr)
+        h = hashlib.sha1()
+        h.update(str(arr.shape).encode('utf-8'))
+        h.update(str(arr.dtype).encode('utf-8'))
+        h.update(arr.view(np.uint8))
+        return arr.size, h.hexdigest()
+    except Exception:
+        return 0, 'invalid'
+
+
+def _build_kk_signature(entry, c=None, max_m=None, fit_type=None):
+    """Build a signature for the exact data/settings used by K-K validation.
+
+    The signature changes when the active impedance points change, e.g. after
+    manual/auto masking, changing the inductance handling, or changing K-K
+    parameters. It lets Run KKR skip files that have already been validated
+    without invalidating their DRT fit status.
+    """
+    if entry is None:
+        return None
+    try:
+        freq = np.asarray(getattr(entry, 'freq', []), dtype=float).reshape(-1)
+        z_exp = np.asarray(getattr(entry, 'Z_exp', []), dtype=complex).reshape(-1)
+        active_idx = np.asarray(getattr(entry, 'active_raw_indices', np.arange(freq.size)), dtype=int).reshape(-1)
+        visible_keep = np.asarray(getattr(entry, 'visible_keep_raw', []), dtype=bool).reshape(-1)
+        mask_total = np.asarray(getattr(entry, 'mask_total_raw', []), dtype=bool).reshape(-1)
+
+        if active_idx.size != freq.size:
+            active_idx = np.arange(freq.size, dtype=int)
+
+        sig = (
+            'kk-v2',
+            'freq', _array_signature_digest(freq, dtype=float),
+            'zre', _array_signature_digest(z_exp.real, dtype=float),
+            'zim', _array_signature_digest(z_exp.imag, dtype=float),
+            'active_raw_indices', _array_signature_digest(active_idx, dtype=int),
+            'visible_keep_raw', _array_signature_digest(visible_keep, dtype=bool),
+            'mask_total_raw', _array_signature_digest(mask_total, dtype=bool),
+        )
+        if c is not None and max_m is not None and fit_type is not None:
+            sig = sig + ('c', float(c), 'max_m', int(max_m), 'fit_type', str(fit_type).strip().lower())
+        return sig
+    except Exception:
+        return None
+
+
+
+def _safe_kk_residual_max(re_res, im_res, n_points: int):
+    """Return max(|Re residual|, |Im residual|) without all-NaN warnings."""
+    n_points = int(n_points or 0)
+    if n_points <= 0:
+        return np.array([], dtype=float)
+
+    re_arr = np.asarray(re_res, dtype=float).reshape(-1)
+    im_arr = np.asarray(im_res, dtype=float).reshape(-1)
+    if re_arr.size != n_points:
+        re_arr = np.full(n_points, np.nan, dtype=float)
+    if im_arr.size != n_points:
+        im_arr = np.full(n_points, np.nan, dtype=float)
+
+    kk_abs = np.vstack([np.abs(re_arr), np.abs(im_arr)])
+    kk_max = np.full(n_points, np.nan, dtype=float)
+    valid_cols = np.any(np.isfinite(kk_abs), axis=0)
+    if np.any(valid_cols):
+        kk_max[valid_cols] = np.nanmax(kk_abs[:, valid_cols], axis=0)
+    return kk_max
+
 def _entry_has_valid_kk(entry) -> bool:
-    """Return True when an entry contains usable K-K fitted impedance data."""
+    """Return True when K-K results match the current active EIS data."""
     if entry is None:
         return False
     try:
@@ -669,7 +743,22 @@ def _entry_has_valid_kk(entry) -> bool:
             return False
         z_fit = np.asarray(getattr(entry, 'kk_Z_fit'))
         freq = np.asarray(getattr(entry, 'freq'))
-        return z_fit.size == freq.size and z_fit.size > 0
+        if z_fit.size != freq.size or z_fit.size <= 0:
+            return False
+
+        stored_sig = getattr(entry, 'kk_signature', None)
+        if stored_sig is None:
+            # Backward compatibility for very old in-memory entries created
+            # before kk_signature existed.
+            return True
+
+        current_sig = _build_kk_signature(
+            entry,
+            c=getattr(entry, 'kk_c', None),
+            max_m=getattr(entry, 'kk_max_m', None),
+            fit_type=getattr(entry, 'kk_fit_type', None),
+        )
+        return stored_sig == current_sig
     except Exception:
         return False
 
@@ -707,7 +796,7 @@ def _finalize_fitted_entry_for_display(fitted_entry, source_entry, used_kk: bool
                  'visible_keep_raw', 'active_raw_indices',
                  'kk_valid', 'kk_c', 'kk_max_m', 'kk_fit_type', 'kk_selected_m', 'kk_mu', 'kk_tau',
                  'kk_R0', 'kk_R', 'kk_L', 'kk_Z_fit', 'kk_res_re_pct', 'kk_res_im_pct',
-                 'kk_res_re_raw_pct', 'kk_res_im_raw_pct', 'kk_Z_fit_raw'):
+                 'kk_res_re_raw_pct', 'kk_res_im_raw_pct', 'kk_Z_fit_raw', 'kk_signature'):
         try:
             if hasattr(source_entry, attr):
                 setattr(fitted_entry, attr, copy.deepcopy(getattr(source_entry, attr)))
@@ -1105,7 +1194,7 @@ class GUI(QtWidgets.QMainWindow):
             kk_im = np.asarray(getattr(entry, 'kk_res_im_raw_pct', np.full(freq0.size, np.nan)), dtype=float)
             if kk_re.size != freq0.size or kk_im.size != freq0.size:
                 raise ValueError('Current K-K residuals are unavailable for threshold masking.')
-            kk_max = np.nanmax(np.vstack([np.abs(kk_re), np.abs(kk_im)]), axis=0)
+            kk_max = _safe_kk_residual_max(kk_re, kk_im, freq0.size)
             auto_mask |= np.isfinite(kk_max) & (kk_max > float(kk_threshold))
 
         return auto_mask
@@ -1612,29 +1701,13 @@ class GUI(QtWidgets.QMainWindow):
         self._update_run_select_button_styles()
 
     def _confirm_raw_fit_if_needed(self, keys, mode: str) -> bool:
-        """Warn before DRT fitting with the original EIS data when K-K is unavailable."""
-        if mode not in ('simple', 'bayesian'):
-            return True
-        missing = []
-        for key in keys or []:
-            entry = getattr(self, 'data_store', {}).get(key)
-            if entry is None:
-                continue
-            if not _entry_has_valid_kk(entry):
-                missing.append(key)
-        if not missing:
-            return True
+        """Allow fitting without showing a K-K validation warning dialog.
 
-        msg = ('K-K validation has not been completed for the selected dataset(s).\n\n'
-               'Are you sure that you want to perform the DRT fitting using the original EIS data?')
-        reply = QtWidgets.QMessageBox.question(
-            self,
-            'K-K Validation Not Completed',
-            msg,
-            QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
-            QtWidgets.QMessageBox.Cancel,
-        )
-        return reply == QtWidgets.QMessageBox.Ok
+        DRT fitting uses the current raw/masked experimental EIS data, not the
+        K-K fitted curve, so K-K validation is treated as an optional quality
+        check rather than a mandatory gate for fitting.
+        """
+        return True
 
     def _current_fit_signature(self, mode: str):
         """Build a signature of the current UI options + selected mode to support skip logic."""
@@ -1991,7 +2064,7 @@ class GUI(QtWidgets.QMainWindow):
                 pass
 
     def kk_run_callback(self):
-        """Run Kramers-Kronig validation for all imported files."""
+        """Run K-K validation only for files whose data/settings changed."""
         keys = self._get_file_keys_in_ui_order()
         if not keys:
             if self.data is None:
@@ -2011,6 +2084,7 @@ class GUI(QtWidgets.QMainWindow):
         self.kk_settings = {'c': c, 'max_m': max_m, 'fit_type': fit_type}
 
         done = 0
+        skipped = 0
         errors = 0
         last_error = None
         for key in keys:
@@ -2019,16 +2093,27 @@ class GUI(QtWidgets.QMainWindow):
             entry = self.data_store.get(key, self.data if key == getattr(self, 'current_file_key', None) else None)
             if entry is None:
                 continue
+
             try:
+                current_signature = _build_kk_signature(entry, c=c, max_m=max_m, fit_type=fit_type)
+                if bool(getattr(entry, 'kk_valid', False)) and getattr(entry, 'kk_signature', None) == current_signature:
+                    _refresh_kk_current_arrays(entry)
+                    if key in self.data_store:
+                        self.data_store[key] = entry
+                    if key == getattr(self, 'current_file_key', None):
+                        self.data = entry
+                    skipped += 1
+                    continue
+
                 _clear_kk_results(entry)
                 entry = _run_lin_kk(entry, c=c, max_m=max_m, fit_type=fit_type)
                 if key in self.data_store:
                     self.data_store[key] = entry
                 if key == getattr(self, 'current_file_key', None):
                     self.data = entry
-                if key in getattr(self, 'file_meta', {}):
-                    self.file_meta[key] = {'fitted': False, 'signature': None}
-                    self._update_file_status(key, fitted=False)
+
+                # K-K validation does not change the DRT input data. Therefore,
+                # it must not reset the existing Fit status/signature.
                 done += 1
             except Exception as e:
                 errors += 1
@@ -2044,7 +2129,7 @@ class GUI(QtWidgets.QMainWindow):
         if getattr(self, 'current_plot_option', None) in ('EIS_data', 'KK_residual'):
             self.plotting_callback(self.current_plot_option)
 
-        msg = f'K-K analysis done: {done} file(s) processed'
+        msg = f'K-K analysis done: {done} processed, {skipped} skipped'
         if errors:
             msg += f', {errors} error(s)'
         try:
@@ -3666,12 +3751,7 @@ class Figure_Canvas(FigureCanvas):
             kk_re = np.full(freq0.size, np.nan, dtype=float)
         if kk_im.size != freq0.size:
             kk_im = np.full(freq0.size, np.nan, dtype=float)
-        if freq0.size:
-            kk_stack = np.vstack([np.abs(kk_re), np.abs(kk_im)])
-            with np.errstate(all='ignore'):
-                kk_max = np.nanmax(kk_stack, axis=0)
-        else:
-            kk_max = np.array([])
+        kk_max = _safe_kk_residual_max(kk_re, kk_im, freq0.size)
 
         disp_idx = np.where(visible_keep)[0].astype(int)
         if disp_idx.size:
@@ -4708,44 +4788,242 @@ def _replace_show_buttons_with_tabs(self) -> None:
             b.hide()
 
     _clear_layout_widget(bar)
-    lay = QtWidgets.QVBoxLayout(bar)
-    lay.setContentsMargins(10, 8, 10, 0)
-    lay.setSpacing(0)
 
-    tabs = QtWidgets.QTabWidget(bar)
-    tabs.setObjectName("TopTabs")
-    tabs.setDocumentMode(True)
-    tabs.setTabPosition(QtWidgets.QTabWidget.North)
-    tabs.setMovable(False)
-    tabs.setUsesScrollButtons(True)
-    tabs.tabBar().setElideMode(QtCore.Qt.ElideNone)
+    lay = QtWidgets.QVBoxLayout(bar)
+    lay.setContentsMargins(10, 4, 10, 0)
+    lay.setSpacing(4)
+
+    # ---------- top thin scrollbar ----------
+    top_scrollbar = QtWidgets.QScrollBar(QtCore.Qt.Horizontal, bar)
+    top_scrollbar.setObjectName("TopTabScrollBar")
+
+    # Make the top scrollbar as thin as the sidebar scrollbar.
+    top_scrollbar.setFixedHeight(2)
+
+    top_scrollbar.setStyleSheet("""
+        QScrollBar#TopTabScrollBar:horizontal {
+            background: transparent;
+            height: 2px;
+            margin: 0px 6px 0px 6px;
+            border: 0px;
+        }
+
+        QScrollBar#TopTabScrollBar::handle:horizontal {
+            background: rgba(60, 60, 67, 0.35);
+            border-radius: 3px;
+            min-width: 60px;
+        }
+
+        QScrollBar#TopTabScrollBar::handle:horizontal:hover {
+            background: rgba(60, 60, 67, 0.50);
+        }
+
+        QScrollBar#TopTabScrollBar::add-line:horizontal,
+        QScrollBar#TopTabScrollBar::sub-line:horizontal {
+            width: 0px;
+            height: 0px;
+            border: 0px;
+            background: transparent;
+        }
+
+        QScrollBar#TopTabScrollBar::add-page:horizontal,
+        QScrollBar#TopTabScrollBar::sub-page:horizontal {
+            background: transparent;
+            border: 0px;
+        }
+    """)
+
+    # ---------- scroll area for tab buttons ----------
+    scroll = QtWidgets.QScrollArea(bar)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+    scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+    scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+    scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+    scroll.setFixedHeight(46)
+    scroll.setStyleSheet("""
+        QScrollArea {
+            border: 0px;
+            background: transparent;
+        }
+    """)
+
+    tab_host = QtWidgets.QWidget(scroll)
+    tab_host.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+
+    tab_layout = QtWidgets.QHBoxLayout(tab_host)
+    tab_layout.setContentsMargins(0, 0, 0, 0)
+    tab_layout.setSpacing(8)
+
+    self._top_tab_buttons = []
+
+    def _make_tab_button(title, src_button):
+        btn = QtWidgets.QPushButton(title, tab_host)
+        btn.setCheckable(True)
+        btn.setMinimumHeight(36)
+        btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        btn.setStyleSheet("""
+            QPushButton {
+                background: #FFFFFF;
+                border: 0px solid #D2D2D7;
+                border-radius: 10px;
+                padding: 6px 14px;
+                color: #1D1D1F;
+            }
+            QPushButton:hover {
+                background: #F2F2F7;
+            }
+            QPushButton:checked {
+                background: #E9E9EE;
+            }
+        """)
+
+        def _clicked():
+            for b in getattr(self, "_top_tab_buttons", []):
+                b.setChecked(False)
+            btn.setChecked(True)
+            if src_button is not None:
+                src_button.click()
+
+        btn.clicked.connect(_clicked)
+        return btn
+
+    for title, src_button in btn_map:
+        btn = _make_tab_button(title, src_button)
+        self._top_tab_buttons.append(btn)
+        tab_layout.addWidget(btn)
+
+    tab_layout.addStretch(1)
+    scroll.setWidget(tab_host)
+
+    # Put scrollbar ABOVE the button row.
+    lay.addWidget(scroll)
+    lay.addWidget(top_scrollbar)
+
+    inner_bar = scroll.horizontalScrollBar()
+
+    def _sync_scrollbar_range():
+        try:
+            top_scrollbar.blockSignals(True)
+            top_scrollbar.setRange(inner_bar.minimum(), inner_bar.maximum())
+            top_scrollbar.setPageStep(max(1, inner_bar.pageStep() // 10))
+            top_scrollbar.setSingleStep(30)
+            top_scrollbar.setValue(inner_bar.value())
+            top_scrollbar.setVisible(inner_bar.maximum() > 0)
+        finally:
+            top_scrollbar.blockSignals(False)
+
+    def _top_to_inner(value):
+        inner_bar.setValue(value)
+
+    def _inner_to_top(value):
+        top_scrollbar.setValue(value)
+
+    top_scrollbar.valueChanged.connect(_top_to_inner)
+    inner_bar.valueChanged.connect(_inner_to_top)
+    inner_bar.rangeChanged.connect(lambda *_: _sync_scrollbar_range())
+
+    # ---------- wheel event: vertical wheel controls horizontal scrolling ----------
+    # ---------- wheel event: mouse wheel switches the selected top tab ----------
+    class TopTabWheelFilter(QtCore.QObject):
+        def __init__(self, gui_window, scroll_area, target_scrollbar):
+            super().__init__(gui_window)
+            self._gui = gui_window
+            self._scroll = scroll_area
+            self._bar = target_scrollbar
+
+        def _current_index(self):
+            buttons = getattr(self._gui, "_top_tab_buttons", []) or []
+            for i, btn in enumerate(buttons):
+                try:
+                    if btn.isChecked():
+                        return i
+                except Exception:
+                    pass
+            return 0
+
+        def _activate_index(self, index):
+            buttons = getattr(self._gui, "_top_tab_buttons", []) or []
+            if not buttons:
+                return
+
+            index = max(0, min(int(index), len(buttons) - 1))
+            btn = buttons[index]
+
+            # Trigger the original button logic:
+            # this checks the button and calls the hidden original show_xxx button.
+            try:
+                btn.click()
+            except Exception:
+                return
+
+            # Make the selected tab visible inside the horizontal scroll area.
+            try:
+                x = btn.x()
+                w = btn.width()
+                view_w = self._scroll.viewport().width()
+                left = self._bar.value()
+                right = left + view_w
+
+                if x < left:
+                    self._bar.setValue(max(self._bar.minimum(), x - 8))
+                elif x + w > right:
+                    self._bar.setValue(min(self._bar.maximum(), x + w - view_w + 8))
+            except Exception:
+                pass
+
+        def eventFilter(self, obj, event):
+            if event.type() == QtCore.QEvent.Wheel:
+                try:
+                    delta = event.angleDelta().y()
+                    if delta == 0:
+                        delta = event.angleDelta().x()
+
+                    if delta == 0:
+                        return False
+
+                    cur = self._current_index()
+
+                    # Wheel down -> next tab; wheel up -> previous tab.
+                    if delta < 0:
+                        self._activate_index(cur + 1)
+                    else:
+                        self._activate_index(cur - 1)
+
+                    event.accept()
+                    return True
+                except Exception:
+                    pass
+
+            return super().eventFilter(obj, event)
+
+    self._top_tab_wheel_filter = TopTabWheelFilter(self, scroll, inner_bar)
+
     try:
-        tabs.tabBar().setExpanding(False)
+        scroll.viewport().installEventFilter(self._top_tab_wheel_filter)
+        scroll.installEventFilter(self._top_tab_wheel_filter)
+        tab_host.installEventFilter(self._top_tab_wheel_filter)
+        top_scrollbar.installEventFilter(self._top_tab_wheel_filter)
+
+        for btn in self._top_tab_buttons:
+            btn.installEventFilter(self._top_tab_wheel_filter)
     except Exception:
         pass
 
-    for title, _ in btn_map:
-        tabs.addTab(QtWidgets.QWidget(), title)
-
-    def _on_tab_changed(i: int) -> None:
-        try:
-            b = btn_map[i][1]
-            if b is not None:
-                b.click()
-        except Exception:
-            pass
-
-    tabs.currentChanged.connect(_on_tab_changed)
-    lay.addWidget(tabs)
-
     try:
-        bar.setMinimumHeight(58)
+        bar.setMinimumHeight(72)
+        bar.setMaximumHeight(88)
         bar.setStyleSheet("border:0px; background: transparent;")
     except Exception:
         pass
 
-    tabs.setCurrentIndex(0)
+    # Make sure range is correct after Qt finishes layout.
+    QtCore.QTimer.singleShot(0, _sync_scrollbar_range)
+    QtCore.QTimer.singleShot(100, _sync_scrollbar_range)
+
     try:
+        if self._top_tab_buttons:
+            self._top_tab_buttons[0].setChecked(True)
         if btn_map[0][1] is not None:
             btn_map[0][1].click()
     except Exception:
