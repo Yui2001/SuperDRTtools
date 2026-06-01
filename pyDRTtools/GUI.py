@@ -327,7 +327,7 @@ class ExternalFileDropFilter(QtCore.QObject):
                 try:
                     if u.isLocalFile():
                         p = u.toLocalFile()
-                        if p and (p.lower().endswith('.csv') or p.lower().endswith('.txt')):
+                        if p and os.path.isfile(p):
                             paths.append(p)
                 except Exception:
                     continue
@@ -996,7 +996,7 @@ class GUI(QtWidgets.QMainWindow):
 
     def import_files(self, single: bool = False):
         """Batch import of .csv and .txt files, tracked in the right-side Files list."""
-        file_filter = "Data files (*.csv *.txt);;CSV files (*.csv);;TXT files (*.txt);;All Files (*)"
+        file_filter = "All supported EIS files (*);;CSV files (*.csv);;TXT files (*.txt);;All Files (*)"
 
         if single:
             path, _ = QFileDialog.getOpenFileName(None, "Please choose a file", "", file_filter)
@@ -1005,7 +1005,7 @@ class GUI(QtWidgets.QMainWindow):
             paths, _ = QFileDialog.getOpenFileNames(None, "Please choose file(s)", "", file_filter)
 
         # keep only csv/txt
-        paths = [p for p in paths if p and (p.lower().endswith('.csv') or p.lower().endswith('.txt'))]
+        paths = [p for p in paths if p and os.path.isfile(p)]
         if not paths:
             return
 
@@ -1034,7 +1034,7 @@ class GUI(QtWidgets.QMainWindow):
     def import_files_from_paths(self, paths):
         """Import files from an explicit list of paths (used for drag & drop)."""
         # keep only csv/txt
-        paths = [p for p in (paths or []) if p and (p.lower().endswith('.csv') or p.lower().endswith('.txt'))]
+        paths = [p for p in (paths or []) if p and os.path.isfile(p)]
         if not paths:
             return
 
@@ -1070,7 +1070,7 @@ class GUI(QtWidgets.QMainWindow):
                 for u in md.urls():
                     if u.isLocalFile():
                         p = u.toLocalFile()
-                        if p and (p.lower().endswith('.csv') or p.lower().endswith('.txt')):
+                        if p and os.path.isfile(p):
                             event.acceptProposedAction()
                             return
         except Exception:
@@ -1086,7 +1086,7 @@ class GUI(QtWidgets.QMainWindow):
                 for u in md.urls():
                     if u.isLocalFile():
                         p = u.toLocalFile()
-                        if p and (p.lower().endswith('.csv') or p.lower().endswith('.txt')):
+                        if p and os.path.isfile(p):
                             paths.append(p)
         except Exception:
             paths = []

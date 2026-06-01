@@ -76,164 +76,200 @@ class EIS_object(object):
 
     @classmethod
     def from_file(cls, filename):
-        """Load EIS data from file.
+        """Load EIS data from CSV/TXT files.
 
-        Supported formats:
-          - Plain 3-column numeric CSV/TXT: freq, Z', Z''
-          - CHI exported EIS files (CSV/TXT): header metadata + column names such as
-            Freq/Hz, Z'/ohm, Z"/ohm ...
+        Supported formats include:
+          1) plain numeric 3-column data: freq, Z', Z''
+          2) header-based data with columns such as:
+             Freq (Hz), Z'(Ohm.cm2), Z''(Ohm.cm2), MOD(Ohm.cm2), Angle(Degree)
+          3) CHI-like exported EIS files with metadata before the column header.
+
+        Notes:
+          - Z_double_prime stored in this object is the true imaginary part Z''.
+          - If a file column is explicitly named -Z'' or -Zim and contains positive
+            Nyquist values, it is converted back to true Z'' by multiplying by -1.
+          - The GUI should still plot Nyquist data as -Z''.
         """
 
-        def _is_chi_like(head_lines):
-            joined = "\n".join(head_lines)
-            # CHI typically has metadata lines with " = " and a header with Freq/Hz
-            return "Freq" in joined and "Hz" in joined and ("Z'" in joined or "Z\"" in joined or "Z" in joined)
+        def _read_text_lines(path):
+            # Try common encodings; errors='ignore' keeps the importer robust.
+            for enc in ("utf-8-sig", "utf-8", "gbk", "latin1"):
+                try:
+                    with open(path, "r", encoding=enc, errors="ignore") as fh:
+                        return fh.read().splitlines()
+                except Exception:
+                    continue
+            with open(path, "r", errors="ignore") as fh:
+                return fh.read().splitlines()
 
-        def _detect_header_and_delim(lines):
-            header_idx = None
-            header_line = None
-            for i, line in enumerate(lines):
-                if ("Freq" in line and "Hz" in line) and (
-                        ("Z'" in line) or ('Z"' in line) or ("Z\"" in line) or ("Z''" in line)):
-                    header_idx = i
-                    header_line = line
-                    break
-            if header_idx is None:
-                raise ValueError("CHI header line not found")
-            # delimiter heuristic
-            comma = header_line.count(",")
-            tab = header_line.count("\t")
-            semi = header_line.count(";")
-            if tab >= comma and tab >= semi and tab > 0:
-                delim = "\t"
-            elif semi > comma and semi > 0:
-                delim = ";"
-            else:
-                delim = ","
-            return header_idx, delim
+        def _split_fields(line: str):
+            line = (line or "").strip()
+            if not line:
+                return []
+            if "\t" in line:
+                return [x.strip() for x in line.split("\t")]
+            if "," in line:
+                return [x.strip() for x in line.split(",")]
+            if ";" in line:
+                return [x.strip() for x in line.split(";")]
+            return [x.strip() for x in re.split(r"\s+", line) if x.strip()]
+
+        def _detect_sep(line: str):
+            line = line or ""
+            counts = {"\t": line.count("\t"), ",": line.count(","), ";": line.count(";")}
+            sep, n = max(counts.items(), key=lambda kv: kv[1])
+            if n > 0:
+                return sep
+            # whitespace-separated text files
+            return r"\s+"
 
         def _normalize(s: str) -> str:
-            s = str(s)
-            s = s.strip().lower()
+            s = str(s).strip().lower()
+            s = s.replace("ω", "ohm").replace("Ω", "ohm")
+            s = s.replace("−", "-").replace("“", '"').replace("”", '"')
             s = re.sub(r"\s+", "", s)
             return s
 
-        def _pick_col(df_cols, candidates):
-            norm_cols = [_normalize(c) for c in df_cols]
-            for cand in candidates:
-                cand_n = _normalize(cand)
-                for i, c in enumerate(norm_cols):
-                    if cand_n == c:
-                        return df_cols[i]
-            # fallback contains-match
-            for cand in candidates:
-                cand_n = _normalize(cand)
-                for i, c in enumerate(norm_cols):
-                    if cand_n in c:
-                        return df_cols[i]
+        def _line_has_column_header(line: str) -> bool:
+            n = _normalize(line)
+            has_freq = ("freq" in n) or ("frequency" in n) or ("f/hz" in n)
+            has_zre = ("z'" in n) or ("zre" in n) or ("zreal" in n) or ("real" in n)
+            has_zim = ("z''" in n) or ('z"' in n) or ("zim" in n) or ("imag" in n)
+            has_mag_angle = ("mod" in n or "mag" in n or "|z|" in n) and ("angle" in n or "phase" in n)
+            return has_freq and ((has_zre and has_zim) or has_mag_angle)
+
+        def _find_header_idx(lines):
+            for i, line in enumerate(lines):
+                if _line_has_column_header(line):
+                    return i
             return None
 
-        def _read_plain_3col_csv(path):
-            # auto-sep, no header, robust to tabs/spaces
-            df = pd.read_csv(path, header=None, engine="python", sep=None, comment="#")
-            if df.shape[1] < 3:
-                raise ValueError("Plain CSV needs >=3 columns")
-            f = pd.to_numeric(df.iloc[:, 0], errors="coerce")
-            zr = pd.to_numeric(df.iloc[:, 1], errors="coerce")
-            zi = pd.to_numeric(df.iloc[:, 2], errors="coerce")
-            out = pd.DataFrame({"f": f, "zr": zr, "zi": zi}).dropna()
+        def _numeric_series(values):
+            # Accept +1.23E+05 strings and quietly drop nonnumeric header/metadata rows.
+            return pd.to_numeric(values, errors="coerce")
+
+        def _looks_like_negative_imag_header(col_name: str) -> bool:
+            n = _normalize(col_name)
+            # Only flip if the column title itself explicitly says -Z'' / -Zim.
+            # A normal Z'' column may contain positive high-frequency inductive points
+            # and negative capacitive points, so it must not be flipped.
+            return (
+                n.startswith("-z''") or n.startswith('-z"') or n.startswith("-zim") or
+                n.startswith("minusz''") or n.startswith("minuszim") or
+                "-z''" in n or '-z"' in n or "-zim" in n
+            )
+
+        def _pick_column(columns, role: str):
+            norm = [_normalize(c) for c in columns]
+
+            if role == "freq":
+                # Prefer frequency columns, but avoid angle/phase/mod columns.
+                for c, n in zip(columns, norm):
+                    if ("freq" in n or "frequency" in n or n in ("f", "f/hz")) and not any(x in n for x in ("angle", "phase", "mod", "mag")):
+                        return c
+                return None
+
+            if role == "zre":
+                for c, n in zip(columns, norm):
+                    if any(x in n for x in ("mod", "mag", "angle", "phase")):
+                        continue
+                    if "z''" in n or 'z"' in n or "zim" in n or "imag" in n:
+                        continue
+                    if "z'" in n or "zre" in n or "zreal" in n or "real" in n:
+                        return c
+                return None
+
+            if role == "zim":
+                for c, n in zip(columns, norm):
+                    if any(x in n for x in ("mod", "mag", "angle", "phase")):
+                        continue
+                    if "z''" in n or 'z"' in n or "zim" in n or "imag" in n:
+                        return c
+                return None
+
+            if role == "mag":
+                for c, n in zip(columns, norm):
+                    if "mod" in n or "mag" in n or "|z|" in n or "abs" in n:
+                        return c
+                return None
+
+            if role == "angle":
+                for c, n in zip(columns, norm):
+                    if "angle" in n or "phase" in n or "degree" in n or "deg" in n:
+                        return c
+                return None
+
+            return None
+
+        def _numeric_dataframe_from_header(path, lines, header_idx):
+            sep = _detect_sep(lines[header_idx])
+            df = pd.read_csv(path, skiprows=header_idx, header=0, engine="python", sep=sep, comment="#")
+            # Drop fully empty columns that can appear after trailing delimiters.
+            df = df.dropna(axis=1, how="all")
+            return df
+
+        def _numeric_dataframe_no_header(path):
+            # Try automatic separator first; fall back to a universal regex separator.
+            try:
+                df = pd.read_csv(path, header=None, engine="python", sep=None, comment="#")
+            except Exception:
+                df = pd.read_csv(path, header=None, engine="python", sep=r"[\t,;\s]+", comment="#")
+            df = df.dropna(axis=1, how="all")
+            return df
+
+        def _extract_from_dataframe(df):
+            if df is None or df.shape[1] < 3:
+                raise ValueError("EIS data needs at least 3 numeric columns.")
+
+            freq_col = _pick_column(df.columns, "freq")
+            zre_col = _pick_column(df.columns, "zre")
+            zim_col = _pick_column(df.columns, "zim")
+            mag_col = _pick_column(df.columns, "mag")
+            angle_col = _pick_column(df.columns, "angle")
+
+            if freq_col is not None and zre_col is not None and zim_col is not None:
+                f = _numeric_series(df[freq_col])
+                zr = _numeric_series(df[zre_col])
+                zi = _numeric_series(df[zim_col])
+                if _looks_like_negative_imag_header(zim_col):
+                    zi = -zi
+            elif freq_col is not None and mag_col is not None and angle_col is not None:
+                # Fallback for files that only provide |Z| and angle.
+                f = _numeric_series(df[freq_col])
+                mag = _numeric_series(df[mag_col])
+                ang_deg = _numeric_series(df[angle_col])
+                zr = mag * np.cos(np.deg2rad(ang_deg))
+                zi = mag * np.sin(np.deg2rad(ang_deg))
+            else:
+                # Last fallback: use the first three columns that can be parsed as numeric.
+                numeric_cols = []
+                for c in df.columns:
+                    s = _numeric_series(df[c])
+                    if s.notna().sum() >= 3:
+                        numeric_cols.append(c)
+                if len(numeric_cols) < 3:
+                    raise ValueError("Required EIS columns not found: frequency, Z', Z''.")
+                f = _numeric_series(df[numeric_cols[0]])
+                zr = _numeric_series(df[numeric_cols[1]])
+                zi = _numeric_series(df[numeric_cols[2]])
+
+            out = pd.DataFrame({"f": f, "zr": zr, "zi": zi}).replace([np.inf, -np.inf], np.nan).dropna()
             out = out[out["f"] > 0]
+
             if out.shape[0] < 3:
-                raise ValueError("Plain CSV parsed too few rows")
+                raise ValueError("Parsed too few valid EIS data rows.")
+
             return out["f"].to_numpy(float), out["zr"].to_numpy(float), out["zi"].to_numpy(float)
 
-        def _read_plain_3col_txt(path):
-            data = np.loadtxt(path)
-            if data.ndim != 2 or data.shape[1] < 3:
-                raise ValueError("Plain TXT needs >=3 columns")
-            f = data[:, 0].astype(float)
-            zr = data[:, 1].astype(float)
-            zi = data[:, 2].astype(float)
-            mask = np.isfinite(f) & np.isfinite(zr) & np.isfinite(zi) & (f > 0)
-            f, zr, zi = f[mask], zr[mask], zi[mask]
-            if f.shape[0] < 3:
-                raise ValueError("Plain TXT parsed too few rows")
-            return f, zr, zi
+        lines = _read_text_lines(filename)
+        header_idx = _find_header_idx(lines)
 
-        def _read_chi(path):
-            # read only the header region to locate the column header line
-            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                lines = fh.read().splitlines()
-
-            header_idx, delim = _detect_header_and_delim(lines)
-
-            # parse with pandas using the discovered header line
-            df = pd.read_csv(path, skiprows=header_idx, header=0, engine="python", sep=delim)
-            if df.shape[0] == 0:
-                raise ValueError("CHI file contains no data rows")
-
-            freq_col = _pick_col(df.columns, ["Freq/Hz", "Frequency/Hz", "Freq(Hz)", "Freq"])
-            zre_col = _pick_col(df.columns, ["Z'/ohm", "Z'(ohm)", "Zre/ohm", "Zre"])
-            zim_col = _pick_col(df.columns, ['Z"/ohm', 'Z"(ohm)', "Z''/ohm", "Zim/ohm", "Zim"])
-
-            if freq_col is None:
-                # last-resort: any column containing 'freq'
-                freq_col = _pick_col(df.columns, ["freq"])
-            if zre_col is None:
-                zre_col = _pick_col(df.columns, ["z'"])
-            if zim_col is None:
-                zim_col = _pick_col(df.columns, ['z"', "z''", "zim"])
-
-            if freq_col is None or zre_col is None or zim_col is None:
-                raise ValueError("CHI required columns not found")
-
-            f = pd.to_numeric(df[freq_col], errors="coerce")
-            zr = pd.to_numeric(df[zre_col], errors="coerce")
-            zi = pd.to_numeric(df[zim_col], errors="coerce")
-
-            out = pd.DataFrame({"f": f, "zr": zr, "zi": zi}).dropna()
-            out = out[out["f"] > 0]
-            if out.shape[0] < 3:
-                raise ValueError("CHI parsed too few rows")
-
-            return out["f"].to_numpy(float), out["zr"].to_numpy(float), out["zi"].to_numpy(float)
-
-        # Fast sniff: read a few lines to decide format
-        head_lines = []
-        try:
-            with open(filename, "r", encoding="utf-8", errors="ignore") as fh:
-                for _ in range(80):
-                    line = fh.readline()
-                    if not line:
-                        break
-                    head_lines.append(line)
-        except Exception:
-            head_lines = []
-
-        is_chi = _is_chi_like(head_lines)
-
-        if filename.lower().endswith(".csv"):
-            if is_chi:
-                freq, Z_prime, Z_double_prime = _read_chi(filename)
-            else:
-                try:
-                    freq, Z_prime, Z_double_prime = _read_plain_3col_csv(filename)
-                except Exception:
-                    # fallback to CHI parser if plain read fails
-                    freq, Z_prime, Z_double_prime = _read_chi(filename)
-
-        elif filename.lower().endswith(".txt"):
-            if is_chi:
-                freq, Z_prime, Z_double_prime = _read_chi(filename)
-            else:
-                try:
-                    freq, Z_prime, Z_double_prime = _read_plain_3col_txt(filename)
-                except Exception:
-                    freq, Z_prime, Z_double_prime = _read_chi(filename)
-
+        if header_idx is not None:
+            df = _numeric_dataframe_from_header(filename, lines, header_idx)
         else:
-            raise ValueError(f"Unsupported file extension: {filename}")
+            df = _numeric_dataframe_no_header(filename)
 
+        freq, Z_prime, Z_double_prime = _extract_from_dataframe(df)
         return cls(freq, Z_prime, Z_double_prime)
 
     def plot_DRT(self):  # plot the DRT result
