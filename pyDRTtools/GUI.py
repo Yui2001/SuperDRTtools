@@ -8,6 +8,7 @@ import os
 import copy
 import hashlib
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 from numpy import absolute, angle
 from PyQt5 import QtGui, QtWidgets, QtCore
@@ -310,7 +311,7 @@ class FileListDelegate(QtWidgets.QStyledItemDelegate):
 
 
 class ExternalFileDropFilter(QtCore.QObject):
-    """Enable drag&drop import of .csv/.txt onto the Files list without breaking InternalMove."""
+    """Enable drag&drop import of EIS text files onto the Files list without breaking InternalMove."""
 
     def __init__(self, gui_window):
         super().__init__(gui_window)
@@ -825,6 +826,12 @@ class GUI(QtWidgets.QMainWindow):
         self.current_plot_option = 'EIS_data'
         self._eis_selected_raw_indices = []
 
+        # project state (no UI/layout changes)
+        self.current_project_path = None
+        self._project_dirty = False
+        self._project_loading = False
+        self._project_io_busy = False
+
         # fit status tracking
         self.file_meta = {}  # keyed by file path: {fitted: bool, signature: tuple|None}
 
@@ -881,7 +888,7 @@ class GUI(QtWidgets.QMainWindow):
             self.ui.files_list.customContextMenuRequested.connect(self._show_files_context_menu)
             self.ui.files_list.setItemDelegate(FileListDelegate(self.ui.files_list))
 
-            # enable drag & drop import onto Files list (csv/txt), keep internal move reorder
+            # enable drag & drop import onto Files list, keep internal move reorder
             try:
                 self.ui.files_list.setAcceptDrops(True)
                 self.ui.files_list.viewport().setAcceptDrops(True)
@@ -960,8 +967,231 @@ class GUI(QtWidgets.QMainWindow):
         self.ui.export_EIS_button.clicked.connect(self.export_EIS)
         self.ui.export_fig_button.clicked.connect(self.export_fig)
 
+        # Existing project controls: connect logic only; do not change button layout/style.
+        if hasattr(self.ui, 'open_project_button'):
+            self.ui.open_project_button.clicked.connect(self.open_project_callback)
+        if hasattr(self.ui, 'save_project_button'):
+            self.ui.save_project_button.clicked.connect(self.save_project_callback)
+            # Right-click on the existing Save button provides Save As without changing the button.
+            self.ui.save_project_button.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            self.ui.save_project_button.customContextMenuRequested.connect(
+                self._show_save_project_context_menu
+            )
+        if hasattr(self.ui, 'save_project_as_button'):
+            self.ui.save_project_as_button.clicked.connect(self.save_project_as_callback)
+        self._project_buttons_connected = True
+
+        self._install_project_dirty_tracking()
+
+    def _project_entry_attributes(self):
+        # Persist imported data and user-visible analysis results only.
+        # Large solver matrices and live C-extension objects are intentionally excluded.
+        return (
+            'method', 'fit_data_source', 'freq', 'freq_0', 'Z_prime', 'Z_prime_0',
+            'Z_double_prime', 'Z_double_prime_0', 'Z_exp', 'Z_exp_0', 'tau', 'tau_fine',
+            'visible_keep_raw', 'active_raw_indices', 'mask_manual_raw', 'mask_auto_raw',
+            'mask_total_raw', 'mask_settings',
+            'kk_valid', 'kk_c', 'kk_max_m', 'kk_fit_type', 'kk_selected_m', 'kk_mu',
+            'kk_tau', 'kk_R0', 'kk_R', 'kk_L', 'kk_Z_fit', 'kk_Z_fit_raw',
+            'kk_res_re_pct', 'kk_res_im_pct', 'kk_res_re_raw_pct', 'kk_res_im_raw_pct',
+            'kk_signature',
+            'lambda_value', 'L', 'R', 'out_tau_vec', 'gamma', 'mean', 'upper_bound',
+            'lower_bound', 'mu_L_0', 'mu_R_inf', 'mu_gamma_fine_re',
+            'mu_gamma_fine_im', 'mu_Z_re', 'mu_Z_im', 'mu_Z_H_re_agm',
+            'mu_Z_H_im_agm', 'band_re_agm', 'band_im_agm', 'res_re', 'res_im',
+            'res_H_re', 'res_H_im', 'out_scores', 'N_peaks', 'out_gamma_fit', 'df'
+        )
+
+    def _entry_to_project_record(self, entry):
+        if entry is None:
+            return None
+        attrs = {}
+        for name in self._project_entry_attributes():
+            if not hasattr(entry, name):
+                continue
+            value = getattr(entry, name)
+            # Keep only values handled by project_io; no Qt/Matplotlib/solver objects.
+            attrs[name] = value
+        return {'attrs': attrs}
+
+    def _entry_from_project_record(self, record):
+        if not isinstance(record, dict):
+            raise ValueError('Invalid EIS entry in project file.')
+        try:
+            entry = EIS_object.__new__(EIS_object)
+        except Exception:
+            entry = SimpleNamespace()
+        for name, value in (record.get('attrs', {}) or {}).items():
+            setattr(entry, name, value)
+        if not hasattr(entry, 'method'):
+            entry.method = 'none'
+        _ensure_mask_state(entry)
+        return entry
+
+    def _capture_project_ui_state(self):
+        combo_names = (
+            'discre_choice', 'data_used_choice', 'induct_choice', 'der_choice',
+            'lambda_choice', 'shape_control_choice', 'fit_type_choice', 'peak_method_choice'
+        )
+        line_names = (
+            'reg_param_entry', 'reg_param_entry_2', 'sample_no_entry', 'FWHM_entry',
+            'cutoff_entry', 'max_elements_entry', 'peak_num_entry'
+        )
+        return {
+            'combo_indices': {
+                name: int(getattr(self.ui, name).currentIndex())
+                for name in combo_names if hasattr(self.ui, name)
+            },
+            'line_texts': {
+                name: str(getattr(self.ui, name).text())
+                for name in line_names if hasattr(self.ui, name)
+            },
+        }
+
+    def _restore_project_ui_state(self, ui_state):
+        ui_state = ui_state or {}
+        for name, index in (ui_state.get('combo_indices', {}) or {}).items():
+            widget = getattr(self.ui, name, None)
+            if widget is None:
+                continue
+            blocker = QtCore.QSignalBlocker(widget)
+            widget.setCurrentIndex(int(index))
+            del blocker
+        for name, text in (ui_state.get('line_texts', {}) or {}).items():
+            widget = getattr(self.ui, name, None)
+            if widget is None:
+                continue
+            blocker = QtCore.QSignalBlocker(widget)
+            widget.setText(str(text))
+            del blocker
+
+    def _build_project_state(self):
+        file_order = self._get_file_keys_in_ui_order()
+        return {
+            'data_store': {
+                key: self._entry_to_project_record(self.data_store[key])
+                for key in file_order if key in self.data_store
+            },
+            'file_meta': copy.deepcopy(self.file_meta),
+            'file_order': list(file_order),
+            'current_file_key': self.current_file_key,
+            'current_plot_option': self.current_plot_option,
+            'selected_run_mode': self.selected_run_mode,
+            'drt_comp_settings': copy.deepcopy(self.drt_comp_settings),
+            'drt_map_settings': copy.deepcopy(self.drt_map_settings),
+            'kk_settings': copy.deepcopy(self.kk_settings),
+            'ui_state': self._capture_project_ui_state(),
+        }
+
+    def _restore_project_state(self, state):
+        if not isinstance(state, dict):
+            raise ValueError('Invalid project state.')
+
+        self._project_loading = True
+        try:
+            records = state.get('data_store', {}) or {}
+            restored = {key: self._entry_from_project_record(rec) for key, rec in records.items()}
+            self.data_store = restored
+            # data_store_raw is only used as an imported-path membership cache in this GUI.
+            self.data_store_raw = {key: None for key in restored}
+            self.file_meta = copy.deepcopy(state.get('file_meta', {}) or {})
+            for key, entry in restored.items():
+                self.file_meta.setdefault(
+                    key,
+                    {'fitted': getattr(entry, 'method', 'none') != 'none', 'signature': None}
+                )
+
+            self.drt_comp_settings = copy.deepcopy(
+                state.get('drt_comp_settings', self.drt_comp_settings) or self.drt_comp_settings
+            )
+            self.drt_map_settings = copy.deepcopy(
+                state.get('drt_map_settings', self.drt_map_settings) or self.drt_map_settings
+            )
+            self.kk_settings = copy.deepcopy(
+                state.get('kk_settings', self.kk_settings) or self.kk_settings
+            )
+            self.selected_run_mode = state.get('selected_run_mode', 'simple')
+            self.current_plot_option = state.get('current_plot_option', 'EIS_data')
+            self._restore_project_ui_state(state.get('ui_state', {}))
+
+            order = [key for key in (state.get('file_order', []) or []) if key in restored]
+            order.extend(key for key in restored if key not in order)
+            target = state.get('current_file_key')
+            if target not in restored:
+                target = order[0] if order else None
+
+            self.current_file_key = target
+            self.data = restored.get(target) if target is not None else None
+            self._eis_selected_raw_indices = []
+
+            if hasattr(self.ui, 'files_list'):
+                blocker = QtCore.QSignalBlocker(self.ui.files_list)
+                self.ui.files_list.clear()
+                selected_row = -1
+                for key in order:
+                    item = QtWidgets.QListWidgetItem(os.path.basename(key))
+                    item.setToolTip(key)
+                    item.setData(QtCore.Qt.UserRole, key)
+                    fitted = bool(self.file_meta.get(key, {}).get('fitted', False))
+                    item.setData(FileListDelegate.STATUS_ROLE, 'Fitted' if fitted else 'Unfitted')
+                    self.ui.files_list.addItem(item)
+                    if key == target:
+                        selected_row = self.ui.files_list.count() - 1
+                if selected_row >= 0:
+                    self.ui.files_list.setCurrentRow(selected_row)
+                del blocker
+
+            self._select_run_mode(self.selected_run_mode)
+        finally:
+            self._project_loading = False
+
+        self.plotting_callback(self.current_plot_option)
+
+    def _install_project_dirty_tracking(self):
+        combo_names = (
+            'discre_choice', 'data_used_choice', 'induct_choice', 'der_choice',
+            'lambda_choice', 'shape_control_choice', 'fit_type_choice', 'peak_method_choice'
+        )
+        line_names = (
+            'reg_param_entry', 'sample_no_entry', 'FWHM_entry',
+            'cutoff_entry', 'max_elements_entry', 'peak_num_entry'
+        )
+        for name in combo_names:
+            widget = getattr(self.ui, name, None)
+            if widget is not None:
+                widget.currentIndexChanged.connect(self._mark_project_dirty)
+        for name in line_names:
+            widget = getattr(self.ui, name, None)
+            if widget is not None:
+                widget.textEdited.connect(self._mark_project_dirty)
+        for name in ('simple_run_button', 'bayesian_button', 'HT_button'):
+            button = getattr(self.ui, name, None)
+            if button is not None:
+                button.clicked.connect(self._mark_project_dirty)
+
+    def _mark_project_dirty(self, *args):
+        if self._project_loading:
+            return
+        if not self.data_store and not self.current_project_path:
+            return
+        self._project_dirty = True
+        self._update_project_window_title()
+
+    def _set_project_clean(self):
+        self._project_dirty = False
+        self._update_project_window_title()
+
+    def _show_save_project_context_menu(self, pos):
+        # Save As is available without changing the existing Save button.
+        menu = QtWidgets.QMenu(self)
+        action = menu.addAction('Save Project As...')
+        action.triggered.connect(self.save_project_as_callback)
+        button = getattr(self.ui, 'save_project_button', None)
+        if button is not None:
+            menu.exec_(button.mapToGlobal(pos))
+
     def _import_paths_into_store(self, paths):
-        """Import a list of CSV/TXT paths into the multi-file stores."""
+        """Import a list of EIS text file paths into the multi-file stores."""
         newly_added = []
         for path in paths:
             if path in self.data_store_raw:
@@ -988,6 +1218,8 @@ class GUI(QtWidgets.QMainWindow):
                 item.setData(FileListDelegate.STATUS_ROLE, 'Unfitted')
                 self.ui.files_list.addItem(item)
 
+        if newly_added:
+            self._mark_project_dirty()
         return newly_added
 
     def import_file(self):
@@ -995,7 +1227,7 @@ class GUI(QtWidgets.QMainWindow):
         self.import_files(single=True)
 
     def import_files(self, single: bool = False):
-        """Batch import of .csv and .txt files, tracked in the right-side Files list."""
+        """Batch import of EIS text files, tracked in the right-side Files list."""
         file_filter = "All supported EIS files (*);;CSV files (*.csv);;TXT files (*.txt);;All Files (*)"
 
         if single:
@@ -1004,7 +1236,7 @@ class GUI(QtWidgets.QMainWindow):
         else:
             paths, _ = QFileDialog.getOpenFileNames(None, "Please choose file(s)", "", file_filter)
 
-        # keep only csv/txt
+        # keep local files; parser handles csv/txt/extensionless EIS text files.
         paths = [p for p in paths if p and os.path.isfile(p)]
         if not paths:
             return
@@ -1033,7 +1265,7 @@ class GUI(QtWidgets.QMainWindow):
 
     def import_files_from_paths(self, paths):
         """Import files from an explicit list of paths (used for drag & drop)."""
-        # keep only csv/txt
+        # keep local files; parser handles csv/txt/extensionless EIS text files.
         paths = [p for p in (paths or []) if p and os.path.isfile(p)]
         if not paths:
             return
@@ -1063,7 +1295,7 @@ class GUI(QtWidgets.QMainWindow):
             pass
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
-        """Accept dropping .csv/.txt files onto the main window."""
+        """Accept dropping EIS text files onto the main window."""
         try:
             md = event.mimeData()
             if md is not None and md.hasUrls():
@@ -1078,7 +1310,7 @@ class GUI(QtWidgets.QMainWindow):
         event.ignore()
 
     def dropEvent(self, event: QtGui.QDropEvent):
-        """Handle dropped .csv/.txt files (append to Files list)."""
+        """Handle dropped EIS text files (append to Files list)."""
         paths = []
         try:
             md = event.mimeData()
@@ -1131,6 +1363,7 @@ class GUI(QtWidgets.QMainWindow):
             self.data = self.data_store[key]
         if refresh_plot:
             self.plotting_callback('EIS_data')
+        self._mark_project_dirty()
 
     def _toggle_mask_point(self, key: str, raw_index: int, masked: bool):
         entry = self.data_store.get(key)
@@ -1549,6 +1782,20 @@ class GUI(QtWidgets.QMainWindow):
         # keep current plot selection across switching
         self.plotting_callback(self.current_plot_option)
 
+    def _select_drt_comparison_line_by_key(self, key):
+        selected_line = None
+        for line in getattr(self, '_drt_comp_lines', []) or []:
+            try:
+                if line.get_gid() == key:
+                    selected_line = line
+                    break
+            except Exception:
+                continue
+        if selected_line is None:
+            self._clear_drt_comp_selection()
+        else:
+            self._apply_drt_comp_selection(selected_line)
+
     def _on_file_selected(self, row: int):
         if row < 0 or not hasattr(self.ui, "files_list"):
             return
@@ -1565,9 +1812,18 @@ class GUI(QtWidgets.QMainWindow):
                 self.data = self.data_store[key]
             self._suppress_file_select = False
             return
+
+        if getattr(self, 'current_plot_option', None) == 'DRT_comparison':
+            self.current_file_key = key
+            self.data = self.data_store.get(key)
+            self._eis_selected_raw_indices = []
+            self._select_drt_comparison_line_by_key(key)
+            return
+
         self._set_current_file(key)
 
     def _on_files_reordered(self, *args, **kwargs):
+        self._mark_project_dirty()
         # Order affects DRT comparison colors AND DRT map row order.
         if getattr(self, 'current_plot_option', None) in ('DRT_comparison', 'DRT_map'):
             self.plotting_callback(self.current_plot_option)
@@ -1628,6 +1884,8 @@ class GUI(QtWidgets.QMainWindow):
                     break
 
         # update current selection
+        self._mark_project_dirty()
+
         if self.current_file_key == key:
             self.current_file_key = None
             self.data = None
@@ -1646,6 +1904,7 @@ class GUI(QtWidgets.QMainWindow):
         self.data = None
         if hasattr(self.ui, "files_list"):
             self.ui.files_list.clear()
+        self._mark_project_dirty()
         self.plotting_callback(self.current_plot_option)  # clears
 
     def _update_run_select_button_styles(self) -> None:
@@ -1829,6 +2088,7 @@ class GUI(QtWidgets.QMainWindow):
         if key in getattr(self, 'file_meta', {}):
             self.file_meta[key] = {'fitted': True, 'signature': signature}
         self._update_file_status(key, fitted=True)
+        self._mark_project_dirty()
 
     def fit_selected_callback(self):
         """Fit only the currently selected file."""
@@ -1967,6 +2227,7 @@ class GUI(QtWidgets.QMainWindow):
             if key in getattr(self, 'file_meta', {}):
                 self.file_meta[key] = {'fitted': True, 'signature': signature}
             self._update_file_status(key, fitted=True)
+            self._mark_project_dirty()
         except Exception:
             pass
 
@@ -2129,6 +2390,9 @@ class GUI(QtWidgets.QMainWindow):
         if getattr(self, 'current_plot_option', None) in ('EIS_data', 'KK_residual'):
             self.plotting_callback(self.current_plot_option)
 
+        if done > 0:
+            self._mark_project_dirty()
+
         msg = f'K-K analysis done: {done} processed, {skipped} skipped'
         if errors:
             msg += f', {errors} error(s)'
@@ -2174,6 +2438,7 @@ class GUI(QtWidgets.QMainWindow):
         # Update the QLineEdit with the computed regularization parameter
         self.ui.reg_param_entry_2.setText(str(entry.lambda_value))
 
+        self._mark_project_dirty()
         self.plotting_callback('DRT_data')
 
     def bayesian_run_callback(self):  # callback for Bayesian regularization
@@ -2196,6 +2461,7 @@ class GUI(QtWidgets.QMainWindow):
         self.data = Bayesian_run(self.data, rbf_type=rbf_type, data_used=data_used, induct_used=induct_used,
                                  der_used=der_used, cv_type=cv_type, reg_param=reg_param, shape_control=shape_control,
                                  coeff=coeff, NMC_sample=sample_number)
+        self._mark_project_dirty()
         self.plotting_callback('DRT_data')
 
     def BHT_run_callback(self):  # callback for Hilbert transform run
@@ -2212,6 +2478,7 @@ class GUI(QtWidgets.QMainWindow):
         # we perform the computation
         self.data = BHT_run(self.data, rbf_type, der_used, shape_control, coeff)
         ##
+        self._mark_project_dirty()
         self.plotting_callback('DRT_data')
 
     def peak_analysis_run_callback(self):  # callback for peak analysis
@@ -2235,6 +2502,9 @@ class GUI(QtWidgets.QMainWindow):
         self.data = peak_analysis(self.data, rbf_type=rbf_type, data_used=data_used, induct_used=induct_used,
                                   der_used=der_used, cv_type=cv_type, reg_param=reg_param, shape_control=shape_control,
                                   coeff=coeff, peak_method=peak_method, N_peaks=N_peaks)
+        if self.current_file_key in self.data_store:
+            self.data_store[self.current_file_key] = self.data
+        self._mark_project_dirty()
         self.plotting_callback('DRT_data')
 
     def plotting_callback(self, plot_to_show):
@@ -2741,6 +3011,7 @@ class GUI(QtWidgets.QMainWindow):
             self.drt_comp_settings['ymax'] = ymax
             self.drt_comp_settings['start_color'] = start_hex.upper()
             self.drt_comp_settings['end_color'] = end_hex.upper()
+            self._mark_project_dirty()
             dlg.accept()
 
         btns.accepted.connect(_apply)
@@ -2810,6 +3081,7 @@ class GUI(QtWidgets.QMainWindow):
         self._drt_comp_scene = self._current_scene
         self._drt_comp_proxy = self._current_proxy
         self.ui.plot_panel.show()
+        self._select_drt_comparison_line_by_key(self.current_file_key)
 
     # ---------------- DRT Map (2D heatmap) ----------------
 
@@ -2901,6 +3173,7 @@ class GUI(QtWidgets.QMainWindow):
             self.drt_map_settings['major_levels'] = maj
             self.drt_map_settings['minor_levels'] = minu
             self.drt_map_settings['fill_mode'] = 'contour' if fill_choice.currentIndex() == 0 else 'grid'
+            self._mark_project_dirty()
             dlg.accept()
 
         btns.accepted.connect(_apply)
@@ -3534,6 +3807,157 @@ class GUI(QtWidgets.QMainWindow):
 
         if path:
             self.statusBar().showMessage('Saved to %s' % path, 1000)
+
+    def _choose_project_path(self, title='Save Project'):
+        default_path = self.current_project_path or ''
+        if not default_path and self.current_file_key:
+            base = os.path.splitext(os.path.basename(self.current_file_key))[0] + '.sdrtp'
+            default_path = os.path.join(os.path.dirname(self.current_file_key), base)
+        path, _ = QFileDialog.getSaveFileName(
+            self, title, default_path, 'SuperDRTtools Project (*.sdrtp)'
+        )
+        if not path:
+            return None
+        if not path.lower().endswith('.sdrtp'):
+            path += '.sdrtp'
+        return path
+
+    def _run_project_io(self, operation, failure_title):
+        if self._project_io_busy:
+            return False
+        self._project_io_busy = True
+        self.setCursor(QtCore.Qt.WaitCursor)
+        try:
+            QtWidgets.QApplication.processEvents()
+            operation()
+            return True
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, failure_title, str(exc))
+            return False
+        finally:
+            self.unsetCursor()
+            self._project_io_busy = False
+
+    def save_project_callback(self):
+        # Existing project -> overwrite it. Normal imported workspace -> first save creates a project.
+        path = self.current_project_path
+        if not path:
+            path = self._choose_project_path('Save Project')
+        if not path:
+            return False
+
+        try:
+            from .project_io import save_project_state
+        except Exception:
+            from project_io import save_project_state
+
+        def _save():
+            save_project_state(path, self._build_project_state())
+
+        if not self._run_project_io(_save, 'Save Project Failed'):
+            return False
+
+        self.current_project_path = path
+        self._set_project_clean()
+        self.statusBar().showMessage(f'Project saved: {path}', 2000)
+        return True
+
+    def save_project_as_callback(self):
+        path = self._choose_project_path('Save Project As')
+        if not path:
+            return False
+
+        try:
+            from .project_io import save_project_state
+        except Exception:
+            from project_io import save_project_state
+
+        def _save_as():
+            save_project_state(path, self._build_project_state())
+
+        if not self._run_project_io(_save_as, 'Save Project As Failed'):
+            return False
+
+        self.current_project_path = path
+        self._set_project_clean()
+        self.statusBar().showMessage(f'Project saved: {path}', 2000)
+        return True
+
+    def _ask_unsaved_changes(self, action_text):
+        return QtWidgets.QMessageBox.question(
+            self,
+            'Unsaved Project',
+            f'The current workspace contains unsaved changes.\n\nSave before {action_text}?',
+            QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Discard | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Save,
+        )
+
+    def open_project_callback(self):
+        if self._project_io_busy:
+            return False
+
+        if self._project_dirty:
+            reply = self._ask_unsaved_changes('opening another project')
+            if reply == QtWidgets.QMessageBox.Cancel:
+                return False
+            if reply == QtWidgets.QMessageBox.Save and not self.save_project_callback():
+                return False
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Open Project', '', 'SuperDRTtools Project (*.sdrtp)'
+        )
+        if not path:
+            return False
+
+        try:
+            from .project_io import load_project_state
+        except Exception:
+            from project_io import load_project_state
+
+        loaded = {}
+        def _load():
+            loaded['state'] = load_project_state(path)
+
+        if not self._run_project_io(_load, 'Open Project Failed'):
+            return False
+
+        try:
+            self._restore_project_state(loaded['state'])
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, 'Open Project Failed', str(exc))
+            return False
+
+        self.current_project_path = path
+        self._set_project_clean()
+        self.statusBar().showMessage(f'Project loaded: {path}', 2000)
+        return True
+
+    def closeEvent(self, event):
+        if not self._project_dirty:
+            event.accept()
+            return
+
+        reply = self._ask_unsaved_changes('closing SuperDRTtools')
+        if reply == QtWidgets.QMessageBox.Cancel:
+            event.ignore()
+            return
+        if reply == QtWidgets.QMessageBox.Discard:
+            event.accept()
+            return
+        if self.save_project_callback():
+            event.accept()
+        else:
+            event.ignore()
+
+    def _update_project_window_title(self):
+        path = getattr(self, 'current_project_path', None)
+        if path:
+            title = f"SuperDRTtools {os.path.basename(path)}"
+        else:
+            title = 'SuperDRTtools'
+        if self._project_dirty:
+            title += ' *'
+        self.setWindowTitle(title)
 
 
 class Figure_Canvas(FigureCanvas):
@@ -4728,25 +5152,94 @@ def _layout_export_group(self) -> None:
     grid = QtWidgets.QGridLayout(gb)
     grid.setContentsMargins(16, 10, 16, 14)
     grid.setHorizontalSpacing(16)
-    grid.setVerticalSpacing(10)
+    grid.setVerticalSpacing(8)
     grid.setColumnStretch(0, 1)
     grid.setColumnStretch(1, 0)
+
+    # 动态创建 Open / Save 两个项目按钮
+    if not hasattr(self.ui, "open_project_label"):
+        self.ui.open_project_label = QtWidgets.QLabel("Open Project", gb)
+    if not hasattr(self.ui, "save_project_label"):
+        self.ui.save_project_label = QtWidgets.QLabel("Save Project", gb)
+
+    if not hasattr(self.ui, "open_project_button"):
+        self.ui.open_project_button = QtWidgets.QPushButton("Open", gb)
+    if not hasattr(self.ui, "save_project_button"):
+        self.ui.save_project_button = QtWidgets.QPushButton("Save", gb)
+
+    # 隐藏之前残留的 Project / Save As
+    for name in [
+        "project_title_label",
+        "save_as_project_label",
+        "save_as_project_button",
+    ]:
+        w = getattr(self.ui, name, None)
+        if w is not None:
+            try:
+                w.hide()
+            except Exception:
+                pass
+
+    # 只连接一次
+    if not getattr(self, "_project_buttons_connected", False):
+        self.ui.open_project_button.clicked.connect(self.open_project_callback)
+        self.ui.save_project_button.clicked.connect(self.save_project_callback)
+        self._project_buttons_connected = True
 
     rows = [
         (self.ui.export_DRT_label, self.ui.export_DRT_button),
         (self.ui.export_EIS_label, self.ui.export_EIS_button),
         (self.ui.export_fig_label, self.ui.export_fig_button),
+        (self.ui.open_project_label, self.ui.open_project_button),
+        (self.ui.save_project_label, self.ui.save_project_button),
     ]
-    keep = {r[0] for r in rows}
+
+    keep = {lab for lab, btn in rows}
     _hide_unmanaged_children(gb, keep)
 
-    for r, (lab, btn) in enumerate(rows):
-        btn.setMinimumHeight(30)
-        btn.setMinimumWidth(110)
+    export_btn_qss = """
+    QPushButton {
+        background: #FFFFFF;
+        border: 1px solid #D2D2D7;
+        border-radius: 10px;
+        padding: 0px 12px;
+        min-height: 0px;
+        max-height: 28px;
+        height: 28px;
+    }
+    QPushButton:hover {
+        background: #F2F2F7;
+        border-color: #C7C7CC;
+    }
+    QPushButton:pressed {
+        background: #EAEAEE;
+        border-color: #BDBDC2;
+    }
+    """
+
+    button_w = 110
+    button_h = 28
+
+    for row, (lab, btn) in enumerate(rows):
+        lab.show()
+        btn.show()
+
+        lab.setStyleSheet("background: transparent;")
+        lab.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        lab.setFixedHeight(button_h)
+        lab.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        btn.setFixedSize(button_w, button_h)
+        btn.setMinimumSize(button_w, button_h)
+        btn.setMaximumSize(button_w, button_h)
         btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        lab.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        grid.addWidget(lab, r, 0)
-        grid.addWidget(btn, r, 1, alignment=QtCore.Qt.AlignRight)
+        btn.setStyleSheet(export_btn_qss)
+
+        grid.setRowMinimumHeight(row, button_h)
+        grid.setRowStretch(row, 0)
+
+        grid.addWidget(lab, row, 0)
+        grid.addWidget(btn, row, 1, alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
 
 def _replace_show_buttons_with_tabs(self) -> None:

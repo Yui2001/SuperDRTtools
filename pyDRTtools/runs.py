@@ -261,6 +261,9 @@ class EIS_object(object):
 
             return out["f"].to_numpy(float), out["zr"].to_numpy(float), out["zi"].to_numpy(float)
 
+        if not str(filename).lower().endswith((".csv", ".txt")):
+            raise ValueError(f"Unsupported file extension: {filename}")
+
         lines = _read_text_lines(filename)
         header_idx = _find_header_idx(lines)
 
