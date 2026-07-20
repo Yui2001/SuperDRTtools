@@ -2,12 +2,16 @@
 __authors__ = 'Francesco Ciucci, Baptiste Py, Ting Hei Wan, Adeleke Maradesa, DongXu Ye'
 
 __date__ = '4th October 2024'
+# FIT_ALL_MULTIPROCESS_PATCH_20260720
 
 import csv
 import os
 import copy
 import hashlib
-from contextlib import nullcontext
+import sys
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager, nullcontext, redirect_stdout, redirect_stderr
 from types import SimpleNamespace
 
 from numpy import absolute, angle
@@ -33,6 +37,74 @@ def _native_thread_limit_ctx(n_threads: int):
         return _threadpool_limits(limits=int(max(1, n_threads)))
     except Exception:
         return nullcontext()
+
+
+@contextmanager
+def _silence_child_process_output():
+    """Silence Python and native stdout/stderr inside a Fit All child process.
+
+    redirect_stdout alone does not catch every C-extension write. The file
+    descriptor redirection also suppresses CVXOPT/native solver output.
+    """
+    devnull = open(os.devnull, 'w')
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    saved_fds = {}
+
+    try:
+        try:
+            old_stdout.flush()
+        except Exception:
+            pass
+        try:
+            old_stderr.flush()
+        except Exception:
+            pass
+
+        for fd in (1, 2):
+            try:
+                saved_fds[fd] = os.dup(fd)
+                os.dup2(devnull.fileno(), fd)
+            except Exception:
+                pass
+
+        sys.stdout = devnull
+        sys.stderr = devnull
+
+        with redirect_stdout(devnull), redirect_stderr(devnull):
+            yield
+
+    finally:
+        try:
+            devnull.flush()
+        except Exception:
+            pass
+
+        for fd, saved_fd in saved_fds.items():
+            try:
+                os.dup2(saved_fd, fd)
+            except Exception:
+                pass
+            try:
+                os.close(saved_fd)
+            except Exception:
+                pass
+
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        try:
+            devnull.close()
+        except Exception:
+            pass
+
+
+def _disable_cvxopt_progress():
+    """Disable CVXOPT iteration tables in the current process."""
+    try:
+        from cvxopt import solvers as _cvx_solvers
+        _cvx_solvers.options['show_progress'] = False
+    except Exception:
+        pass
 
 
 def apply_flat_theme(app: QtWidgets.QApplication) -> None:
@@ -452,6 +524,31 @@ class _FitWorker(QtCore.QRunnable):
         raise ValueError(f"Unknown mode: {mode}")
 
 
+def _fit_process_task(key: str, entry, mode: str, params: dict, signature):
+    """Run one complete fit in a separate Python process.
+
+    This is a module-level function so Windows ``spawn`` can pickle/import it.
+    Each process uses one native numerical thread; parallelism comes from
+    multiple independent file-fitting processes.
+    """
+    params = dict(params or {})
+    n_native = int(params.get('native_threads', 1) or 1)
+
+    # Avoid nested BLAS/OpenMP parallelism inside every worker process.
+    os.environ['OMP_NUM_THREADS'] = str(max(1, n_native))
+    os.environ['OPENBLAS_NUM_THREADS'] = str(max(1, n_native))
+    os.environ['MKL_NUM_THREADS'] = str(max(1, n_native))
+    os.environ['NUMEXPR_NUM_THREADS'] = str(max(1, n_native))
+
+    _disable_cvxopt_progress()
+
+    with _silence_child_process_output():
+        with _native_thread_limit_ctx(n_native):
+            fitted_entry = _FitWorker._run_fit(entry, mode, params)
+
+    return key, fitted_entry, signature
+
+
 def _get_entry_raw_arrays(entry):
     """Return immutable raw impedance arrays for an entry; create *_0 attrs if missing."""
     if entry is None:
@@ -833,7 +930,8 @@ class GUI(QtWidgets.QMainWindow):
         self._project_io_busy = False
 
         # fit status tracking
-        self.file_meta = {}  # keyed by file path: {fitted: bool, signature: tuple|None}
+        self.file_meta = {}  # keyed by file path: {fitted, signature, display_name}
+        self._fit_all_total = 0
 
         # selected run mode (simple/bayesian/BHT)
         self.selected_run_mode = 'simple'
@@ -942,14 +1040,15 @@ class GUI(QtWidgets.QMainWindow):
         if hasattr(self.ui, 'run_kkr_button'):
             self.ui.run_kkr_button.clicked.connect(self.kk_run_callback)
 
-        # thread pool for parallel fitting (Fit All)
-        self._fit_pool = QtCore.QThreadPool.globalInstance()
-        try:
-            # Use all available logical cores (leave 1 core for UI responsiveness).
-            max_workers = int(os.cpu_count() or 1)
-            self._fit_pool.setMaxThreadCount(max(1, max_workers - 1))
-        except Exception:
-            pass
+        # Process-based parallel fitting (Fit All).
+        # A fresh executor is created for each Fit All run and shut down when done.
+        self._fit_executor = None
+        self._fit_futures = {}
+        self._fit_worker_count = 0
+        self._fit_poll_timer = QtCore.QTimer(self)
+        self._fit_poll_timer.setInterval(100)
+        self._fit_poll_timer.timeout.connect(self._poll_fit_processes)
+
         self._fit_all_active = False
         self._fit_all_pending = 0
         self._fit_all_done = 0
@@ -972,6 +1071,9 @@ class GUI(QtWidgets.QMainWindow):
             self.ui.open_project_button.clicked.connect(self.open_project_callback)
         if hasattr(self.ui, 'save_project_button'):
             self.ui.save_project_button.clicked.connect(self.save_project_callback)
+            self.ui.save_project_button.setToolTip(
+                'Right-click to choose Save Project As...'
+            )
             # Right-click on the existing Save button provides Save As without changing the button.
             self.ui.save_project_button.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
             self.ui.save_project_button.customContextMenuRequested.connect(
@@ -1129,7 +1231,7 @@ class GUI(QtWidgets.QMainWindow):
                 self.ui.files_list.clear()
                 selected_row = -1
                 for key in order:
-                    item = QtWidgets.QListWidgetItem(os.path.basename(key))
+                    item = QtWidgets.QListWidgetItem(self._display_name_for_key(key))
                     item.setToolTip(key)
                     item.setData(QtCore.Qt.UserRole, key)
                     fitted = bool(self.file_meta.get(key, {}).get('fitted', False))
@@ -1209,10 +1311,14 @@ class GUI(QtWidgets.QMainWindow):
             self.data_store_raw[path] = raw_obj
             self.data_store[path] = copy.deepcopy(raw_obj)
             newly_added.append(path)
-            self.file_meta[path] = {'fitted': False, 'signature': None}
+            self.file_meta[path] = {
+                'fitted': False,
+                'signature': None,
+                'display_name': os.path.basename(path),
+            }
 
             if hasattr(self.ui, "files_list"):
-                item = QtWidgets.QListWidgetItem(os.path.basename(path))
+                item = QtWidgets.QListWidgetItem(self._display_name_for_key(path))
                 item.setToolTip(path)
                 item.setData(QtCore.Qt.UserRole, path)
                 item.setData(FileListDelegate.STATUS_ROLE, 'Unfitted')
@@ -1349,7 +1455,10 @@ class GUI(QtWidgets.QMainWindow):
             _refresh_kk_current_arrays(obj)
 
         if reset_method and key in getattr(self, 'file_meta', {}):
-            self.file_meta[key] = {'fitted': False, 'signature': None}
+            meta = dict(self.file_meta.get(key) or {})
+            meta.update({'fitted': False, 'signature': None})
+            meta.setdefault('display_name', os.path.basename(key))
+            self.file_meta[key] = meta
             self._update_file_status(key, fitted=False)
 
         self.data_store[key] = obj
@@ -1405,7 +1514,13 @@ class GUI(QtWidgets.QMainWindow):
 
     @staticmethod
     def _build_auto_mask_from_settings(entry, freq_min=None, freq_max=None, kk_threshold=None):
-        """Build an automatic mask from frequency and/or K-K residual criteria."""
+        """Build an automatic mask from frequency and/or K-K residual criteria.
+
+        Frequency min/max define the frequency range to KEEP. Points outside that
+        range are masked. The previous implementation masked points inside the
+        selected range, which could remove the entire spectrum and make the Qt
+        callback terminate with an uncaught exception.
+        """
         entry = _ensure_mask_state(entry)
         freq0, _, _, _ = _get_entry_raw_arrays(entry)
         auto_mask = np.zeros(freq0.size, dtype=bool)
@@ -1413,45 +1528,111 @@ class GUI(QtWidgets.QMainWindow):
         if freq_min is not None or freq_max is not None:
             f_lo = float(freq_min) if freq_min is not None else None
             f_hi = float(freq_max) if freq_max is not None else None
+
+            if f_lo is not None and (not np.isfinite(f_lo) or f_lo <= 0):
+                raise ValueError('Frequency min must be a positive finite number.')
+            if f_hi is not None and (not np.isfinite(f_hi) or f_hi <= 0):
+                raise ValueError('Frequency max must be a positive finite number.')
             if f_lo is not None and f_hi is not None and f_lo > f_hi:
-                f_lo, f_hi = f_hi, f_lo
-            freq_mask = np.ones(freq0.size, dtype=bool)
+                raise ValueError('Frequency min cannot be greater than frequency max.')
+
+            # Mask points OUTSIDE the retained frequency range.
             if f_lo is not None:
-                freq_mask &= freq0 >= f_lo
+                auto_mask |= freq0 < f_lo
             if f_hi is not None:
-                freq_mask &= freq0 <= f_hi
-            auto_mask |= freq_mask
+                auto_mask |= freq0 > f_hi
 
         if kk_threshold is not None:
-            kk_re = np.asarray(getattr(entry, 'kk_res_re_raw_pct', np.full(freq0.size, np.nan)), dtype=float)
-            kk_im = np.asarray(getattr(entry, 'kk_res_im_raw_pct', np.full(freq0.size, np.nan)), dtype=float)
+            threshold = float(kk_threshold)
+            if not np.isfinite(threshold) or threshold < 0:
+                raise ValueError('K-K residual threshold must be a non-negative finite number.')
+
+            kk_re = np.asarray(
+                getattr(entry, 'kk_res_re_raw_pct', np.full(freq0.size, np.nan)),
+                dtype=float,
+            ).reshape(-1)
+            kk_im = np.asarray(
+                getattr(entry, 'kk_res_im_raw_pct', np.full(freq0.size, np.nan)),
+                dtype=float,
+            ).reshape(-1)
             if kk_re.size != freq0.size or kk_im.size != freq0.size:
                 raise ValueError('Current K-K residuals are unavailable for threshold masking.')
             kk_max = _safe_kk_residual_max(kk_re, kk_im, freq0.size)
-            auto_mask |= np.isfinite(kk_max) & (kk_max > float(kk_threshold))
+            auto_mask |= np.isfinite(kk_max) & (kk_max > threshold)
 
         return auto_mask
 
     def _apply_mask_settings_to_keys(self, keys, freq_min=None, freq_max=None, kk_threshold=None):
-        """Apply automatic mask settings to one or more files."""
+        """Safely apply automatic mask settings to one or more files.
+
+        Every target file is validated before any file is changed. This prevents
+        Apply to All Files from leaving a partially modified project when one
+        spectrum would have too few remaining points.
+        """
         valid_keys = [k for k in (keys or []) if k in self.data_store]
         if not valid_keys:
-            return
+            raise ValueError('No valid files were selected for masking.')
 
-        for key in valid_keys:
-            entry = self.data_store.get(key)
+        induct_index = int(self.ui.induct_choice.currentIndex())
+        proposed = []
+
+        # Validation pass: do not mutate any entry yet.
+        for target_key in valid_keys:
+            entry = self.data_store.get(target_key)
             if entry is None:
                 continue
+
             entry = _ensure_mask_state(entry)
-            entry.mask_auto_raw = self._build_auto_mask_from_settings(
-                entry, freq_min=freq_min, freq_max=freq_max, kk_threshold=kk_threshold
+            auto_mask = self._build_auto_mask_from_settings(
+                entry,
+                freq_min=freq_min,
+                freq_max=freq_max,
+                kk_threshold=kk_threshold,
             )
-            entry.mask_settings = {'freq_min': freq_min, 'freq_max': freq_max, 'kk_threshold': kk_threshold}
-            self.data_store[key] = entry
-            self._rebuild_after_mask_change(key, refresh_plot=False)
+
+            freq0, _, zim0, _ = _get_entry_raw_arrays(entry)
+            manual_mask = np.asarray(
+                getattr(entry, 'mask_manual_raw', np.zeros(freq0.size, dtype=bool)),
+                dtype=bool,
+            ).reshape(-1)
+
+            visible_keep = np.ones(freq0.size, dtype=bool)
+            if induct_index == 2:  # discard inductive data
+                visible_keep = (-zim0) > 0
+
+            active_keep = visible_keep & (~(manual_mask | auto_mask))
+            remaining = int(np.count_nonzero(active_keep))
+            if remaining < 3:
+                raise ValueError(
+                    f'{os.path.basename(target_key)} would have only {remaining} valid point(s) '
+                    'after masking. Please relax the frequency range, K-K threshold, '
+                    'manual mask, or inductance filtering.'
+                )
+
+            proposed.append((target_key, entry, auto_mask))
+
+        if not proposed:
+            raise ValueError('No valid files were available for masking.')
+
+        # Commit pass. Validation above guarantees that the normal rebuild cannot
+        # fail because all points were removed.
+        changed_keys = []
+        try:
+            for target_key, entry, auto_mask in proposed:
+                entry.mask_auto_raw = np.asarray(auto_mask, dtype=bool).copy()
+                entry.mask_settings = {
+                    'freq_min': freq_min,
+                    'freq_max': freq_max,
+                    'kk_threshold': kk_threshold,
+                }
+                self.data_store[target_key] = entry
+                self._rebuild_after_mask_change(target_key, refresh_plot=False)
+                changed_keys.append(target_key)
+        except Exception as exc:
+            raise RuntimeError(f'Failed while rebuilding masked data: {exc}') from exc
 
         current_key = getattr(self, 'current_file_key', None)
-        if current_key in valid_keys:
+        if current_key in changed_keys:
             self.data = self.data_store.get(current_key)
             self.plotting_callback('EIS_data')
 
@@ -1498,7 +1679,7 @@ class GUI(QtWidgets.QMainWindow):
         root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(12)
 
-        title = QtWidgets.QLabel('Mask points by frequency range and/or K-K residual threshold.', dlg)
+        title = QtWidgets.QLabel('Keep points inside the frequency range and mask points exceeding the K-K residual threshold.', dlg)
         title.setWordWrap(True)
         title.setStyleSheet('font-weight: 600;')
         root.addWidget(title)
@@ -1534,7 +1715,7 @@ class GUI(QtWidgets.QMainWindow):
 
         form.addRow('Frequency min (Hz)', fmin_edit)
         form.addRow('Frequency max (Hz)', fmax_edit)
-        form.addRow('K-K residual > (%)', thr_edit)
+        form.addRow('Lin-KK residual > (%)', thr_edit)
         root.addWidget(form_widget)
 
         button_grid = QtWidgets.QGridLayout()
@@ -1590,8 +1771,16 @@ class GUI(QtWidgets.QMainWindow):
             values = _read_settings([key])
             if values is None:
                 return
-            fmin, fmax, thr = values
-            self._apply_mask_settings_to_current(freq_min=fmin, freq_max=fmax, kk_threshold=thr)
+            try:
+                fmin, fmax, thr = values
+                self._apply_mask_settings_to_current(
+                    freq_min=fmin,
+                    freq_max=fmax,
+                    kk_threshold=thr,
+                )
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, 'Mask could not be applied', str(exc))
+                return
             dlg.accept()
 
         def _apply_all():
@@ -1599,16 +1788,33 @@ class GUI(QtWidgets.QMainWindow):
             values = _read_settings(target_keys)
             if values is None:
                 return
-            fmin, fmax, thr = values
-            self._apply_mask_settings_to_keys(target_keys, freq_min=fmin, freq_max=fmax, kk_threshold=thr)
+            try:
+                fmin, fmax, thr = values
+                self._apply_mask_settings_to_keys(
+                    target_keys,
+                    freq_min=fmin,
+                    freq_max=fmax,
+                    kk_threshold=thr,
+                )
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, 'Masks could not be applied', str(exc))
+                return
             dlg.accept()
 
         def _clear_current():
-            self._clear_auto_mask_for_keys([key])
+            try:
+                self._clear_auto_mask_for_keys([key])
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, 'Auto mask could not be cleared', str(exc))
+                return
             dlg.accept()
 
         def _clear_all():
-            self._clear_auto_mask_for_keys(self._get_file_keys_in_ui_order())
+            try:
+                self._clear_auto_mask_for_keys(self._get_file_keys_in_ui_order())
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, 'Auto masks could not be cleared', str(exc))
+                return
             dlg.accept()
 
         apply_btn.clicked.connect(_apply_current)
@@ -1836,12 +2042,15 @@ class GUI(QtWidgets.QMainWindow):
         menu = QtWidgets.QMenu(self)
         item = self.ui.files_list.itemAt(pos)
 
+        act_rename = QtWidgets.QAction("Rename", self)
         act_clear_current = QtWidgets.QAction("Clear", self)
         act_clear_all = QtWidgets.QAction("Clear all files", self)
 
         if item is None:
+            act_rename.setEnabled(False)
             act_clear_current.setEnabled(False)
 
+        menu.addAction(act_rename)
         menu.addAction(act_clear_current)
         menu.addSeparator()
         menu.addAction(act_clear_all)
@@ -1850,6 +2059,50 @@ class GUI(QtWidgets.QMainWindow):
             QMenu { background:#FFFFFF;color:#1D1D1F;border:0px solid #E5E5EA;border-radius:10px; }
             QMenu::item { color:#1D1D1F;padding:6px 10px;min-height:28px; }
         """)
+
+        def _rename_current():
+            if item is None:
+                return
+            key = item.data(QtCore.Qt.UserRole)
+            if not key:
+                return
+
+            current_name = self._display_name_for_key(key)
+            new_name, accepted = QtWidgets.QInputDialog.getText(
+                self,
+                "Rename file",
+                "File name:",
+                QtWidgets.QLineEdit.Normal,
+                current_name,
+            )
+            if not accepted:
+                return
+
+            new_name = str(new_name).strip()
+            if not new_name:
+                QtWidgets.QMessageBox.warning(self, "Rename file", "The file name cannot be empty.")
+                return
+
+            # Rename only the displayed project name. Keep the original full-path
+            # key unchanged so reloading, fitting and project save remain stable.
+            meta = dict(getattr(self, 'file_meta', {}).get(key) or {})
+            meta['display_name'] = new_name
+            meta.setdefault('fitted', False)
+            meta.setdefault('signature', None)
+            self.file_meta[key] = meta
+            item.setText(new_name)
+            item.setToolTip(key)
+            self._mark_project_dirty()
+
+            if getattr(self, 'current_plot_option', None) in ('DRT_comparison', 'DRT_map'):
+                try:
+                    self.plotting_callback(self.current_plot_option)
+                except Exception:
+                    pass
+            try:
+                self.statusBar().showMessage(f'Renamed: {new_name}', 2000)
+            except Exception:
+                pass
 
         def _clear_current():
             if item is None:
@@ -1860,6 +2113,7 @@ class GUI(QtWidgets.QMainWindow):
         def _clear_all():
             self._remove_all_files()
 
+        act_rename.triggered.connect(_rename_current)
         act_clear_current.triggered.connect(_clear_current)
         act_clear_all.triggered.connect(_clear_all)
 
@@ -2086,22 +2340,47 @@ class GUI(QtWidgets.QMainWindow):
             self.data = entry
 
         if key in getattr(self, 'file_meta', {}):
-            self.file_meta[key] = {'fitted': True, 'signature': signature}
+            meta = dict(self.file_meta.get(key) or {})
+            meta.update({'fitted': True, 'signature': signature})
+            meta.setdefault('display_name', os.path.basename(key))
+            self.file_meta[key] = meta
         self._update_file_status(key, fitted=True)
         self._mark_project_dirty()
 
     def fit_selected_callback(self):
-        """Fit only the currently selected file."""
+        """Fit only the current file and keep progress visible in the status bar."""
         if getattr(self, 'current_file_key', None) is None or self.data is None:
             return
 
         mode = getattr(self, 'selected_run_mode', 'simple')
         if not self._confirm_raw_fit_if_needed([self.current_file_key], mode):
             return
-        self._fit_key(self.current_file_key, mode, update_ui=True)
-        self.plotting_callback(
-            self.current_plot_option if getattr(self, 'current_plot_option', None) in ('DRT_comparison',
-                                                                                       'DRT_map') else 'DRT_data')
+
+        key = self.current_file_key
+        display_name = self._display_name_for_key(key)
+        try:
+            self.statusBar().showMessage(f'Fitting: 0/1 completed (0%) | {display_name}')
+            QtWidgets.QApplication.processEvents()
+        except Exception:
+            pass
+
+        try:
+            self._fit_key(key, mode, update_ui=True)
+            self.plotting_callback(
+                self.current_plot_option if getattr(self, 'current_plot_option', None) in ('DRT_comparison',
+                                                                                           'DRT_map') else 'DRT_data')
+        except Exception as e:
+            try:
+                self.statusBar().showMessage(f'Fitting failed: {display_name}', 5000)
+                QtWidgets.QMessageBox.warning(self, 'Fit failed', str(e))
+            except Exception:
+                pass
+            return
+
+        try:
+            self.statusBar().showMessage(f'Fitting complete: 1/1 (100%) | {display_name}', 4000)
+        except Exception:
+            pass
 
     def fit_all_callback(self):
         """Fit all files in the list in parallel; skip those already fitted with the same signature."""
@@ -2172,25 +2451,94 @@ class GUI(QtWidgets.QMainWindow):
             return
 
         self._fit_all_active = True
+        self._fit_all_total = len(to_fit)
         self._fit_all_pending = len(to_fit)
         self._fit_all_done = 0
         self._fit_all_skipped = n_skip
         self._fit_all_errors = 0
 
-        # schedule workers
-        for key in to_fit:
-            try:
-                entry_copy = copy.deepcopy(self.data_store.get(key))
-            except Exception:
-                entry_copy = self.data_store.get(key)
+        try:
+            self.statusBar().showMessage(
+                f'Preparing Fit All: 0/{self._fit_all_total} tasks submitted'
+            )
+            QtWidgets.QApplication.processEvents()
+        except Exception:
+            pass
 
-            worker = _FitWorker(key=key, entry=entry_copy, mode=mode, params=params, signature=signature)
-            worker.signals.finished.connect(self._on_fit_worker_finished)
-            worker.signals.error.connect(self._on_fit_worker_error)
-            self._fit_pool.start(worker)
+        # Real multi-process scheduling: one file per process.
+        # Leave one logical core for the GUI/main OS tasks.
+        logical_cores = int(os.cpu_count() or 1)
+        max_processes = max(1, logical_cores - 1)
+        worker_count = min(len(to_fit), max_processes)
+
+        # Each process stays single-threaded internally. Increasing this value
+        # usually only causes BLAS oversubscription and does not speed up CVXOPT.
+        params['native_threads'] = 1
 
         try:
-            self.statusBar().showMessage(f'Fit all started: {len(to_fit)} running, {n_skip} skipped', 2000)
+            mp.freeze_support()
+            mp_context = mp.get_context('spawn')
+            self._fit_executor = ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=mp_context,
+            )
+            self._fit_worker_count = worker_count
+            self._fit_futures = {}
+
+            for submitted, key in enumerate(to_fit, start=1):
+                try:
+                    entry_copy = copy.deepcopy(self.data_store.get(key))
+                except Exception:
+                    entry_copy = self.data_store.get(key)
+
+                future = self._fit_executor.submit(
+                    _fit_process_task,
+                    key,
+                    entry_copy,
+                    mode,
+                    params,
+                    signature,
+                )
+                self._fit_futures[future] = key
+
+                try:
+                    self.statusBar().showMessage(
+                        f'Preparing Fit All: {submitted}/{self._fit_all_total} tasks submitted | {worker_count} processes'
+                    )
+                    QtWidgets.QApplication.processEvents()
+                except Exception:
+                    pass
+
+            self._fit_poll_timer.start()
+
+        except Exception as e:
+            self._fit_all_active = False
+            self._fit_all_pending = 0
+            self._shutdown_fit_process_pool(cancel=True)
+            try:
+                QtWidgets.QMessageBox.warning(self, 'Fit All failed to start', str(e))
+            except Exception:
+                pass
+            return
+
+        self._update_fit_all_progress_status()
+
+    def _update_fit_all_progress_status(self):
+        """Keep Fit All progress visible until all process tasks finish."""
+        total = int(getattr(self, '_fit_all_total', 0) or 0)
+        done = int(getattr(self, '_fit_all_done', 0) or 0)
+        errors = int(getattr(self, '_fit_all_errors', 0) or 0)
+        completed = min(total, done + errors)
+        remaining = max(0, total - completed)
+        percent = int(round(100.0 * completed / total)) if total else 100
+        processes = int(getattr(self, '_fit_worker_count', 0) or 0)
+        skipped = int(getattr(self, '_fit_all_skipped', 0) or 0)
+        try:
+            self.statusBar().showMessage(
+                f'Fitting: {completed}/{total} completed ({percent}%) | '
+                f'{remaining} remaining | {processes} processes | '
+                f'{errors} errors | {skipped} skipped'
+            )
         except Exception:
             pass
 
@@ -2216,6 +2564,83 @@ class GUI(QtWidgets.QMainWindow):
 
         return params
 
+    def _poll_fit_processes(self):
+        """Collect completed process futures in the Qt main thread."""
+        if not getattr(self, '_fit_all_active', False):
+            try:
+                self._fit_poll_timer.stop()
+            except Exception:
+                pass
+            return
+
+        completed = [
+            future for future in list(getattr(self, '_fit_futures', {}).keys())
+            if future.done()
+        ]
+
+        for future in completed:
+            key = self._fit_futures.pop(future, None)
+            if key is None:
+                continue
+
+            try:
+                result_key, fitted_entry, signature = future.result()
+                self._on_fit_worker_finished(result_key, fitted_entry, signature)
+            except Exception as e:
+                self._on_fit_worker_error(key, str(e))
+
+        if not self._fit_futures and getattr(self, '_fit_all_pending', 0) <= 0:
+            try:
+                self._fit_poll_timer.stop()
+            except Exception:
+                pass
+
+
+    def _shutdown_fit_process_pool(self, cancel: bool = False, terminate: bool = False):
+        """Best-effort cleanup for the Fit All process executor."""
+        try:
+            self._fit_poll_timer.stop()
+        except Exception:
+            pass
+
+        futures = getattr(self, '_fit_futures', {}) or {}
+        if cancel:
+            for future in list(futures.keys()):
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+
+        executor = getattr(self, '_fit_executor', None)
+
+        # On application close, actively terminate running child processes so
+        # Python does not wait for unfinished fits after the window disappears.
+        if terminate and executor is not None:
+            try:
+                for process in list(getattr(executor, '_processes', {}).values()):
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=bool(cancel))
+            except TypeError:
+                try:
+                    executor.shutdown(wait=False)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        self._fit_executor = None
+        self._fit_futures = {}
+        self._fit_worker_count = 0
+
+
     @QtCore.pyqtSlot(str, object, object)
     def _on_fit_worker_finished(self, key: str, fitted_entry, signature):
         """Main-thread slot: store results + update status."""
@@ -2225,7 +2650,10 @@ class GUI(QtWidgets.QMainWindow):
                 self.data = fitted_entry
 
             if key in getattr(self, 'file_meta', {}):
-                self.file_meta[key] = {'fitted': True, 'signature': signature}
+                meta = dict(self.file_meta.get(key) or {})
+                meta.update({'fitted': True, 'signature': signature})
+                meta.setdefault('display_name', os.path.basename(key))
+                self.file_meta[key] = meta
             self._update_file_status(key, fitted=True)
             self._mark_project_dirty()
         except Exception:
@@ -2237,6 +2665,7 @@ class GUI(QtWidgets.QMainWindow):
         except Exception:
             return
 
+        self._update_fit_all_progress_status()
         if self._fit_all_pending <= 0:
             self._finish_fit_all_parallel()
 
@@ -2250,17 +2679,22 @@ class GUI(QtWidgets.QMainWindow):
 
         try:
             if key in getattr(self, 'file_meta', {}):
-                self.file_meta[key] = {'fitted': False, 'signature': None}
+                meta = dict(self.file_meta.get(key) or {})
+                meta.update({'fitted': False, 'signature': None})
+                meta.setdefault('display_name', os.path.basename(key))
+                self.file_meta[key] = meta
             self._update_file_status(key, fitted=False)
         except Exception:
             pass
 
+        self._update_fit_all_progress_status()
         if self._fit_all_pending <= 0:
             self._finish_fit_all_parallel()
 
     def _finish_fit_all_parallel(self):
-        """Finalize Fit All after all workers complete."""
+        """Finalize Fit All after all process workers complete."""
         self._fit_all_active = False
+        self._shutdown_fit_process_pool(cancel=False)
 
         try:
             current_key = self._fit_all_restore.get('current_key')
@@ -2281,8 +2715,9 @@ class GUI(QtWidgets.QMainWindow):
 
         try:
             self.statusBar().showMessage(
-                f'Fit all done: {self._fit_all_done} fitted, {self._fit_all_skipped} skipped, {self._fit_all_errors} errors',
-                2500
+                f'Fit all done: {self._fit_all_done}/{self._fit_all_total} fitted, '
+                f'{self._fit_all_skipped} skipped, {self._fit_all_errors} errors',
+                5000
             )
         except Exception:
             pass
@@ -2615,6 +3050,19 @@ class GUI(QtWidgets.QMainWindow):
             keys = list(getattr(self, 'data_store', {}).keys())
         return keys
 
+    def _display_name_for_key(self, key):
+        """Return the user-facing name while retaining the original source path."""
+        if not key:
+            return ""
+        try:
+            meta = (getattr(self, 'file_meta', {}).get(key, {}) or {})
+            name = meta.get('display_name')
+            if name is not None and str(name).strip():
+                return str(name).strip()
+        except Exception:
+            pass
+        return os.path.basename(key)
+
     @staticmethod
     def _hex_to_rgb(hex_color: str):
         h = (hex_color or '').strip()
@@ -2863,7 +3311,7 @@ class GUI(QtWidgets.QMainWindow):
             key = ln.get_gid()
         except Exception:
             key = None
-        fname = os.path.basename(key) if key else "Curve"
+        fname = self._display_name_for_key(key) if key else "Curve"
 
         try:
             tau_val = float(ln.get_xdata()[idx])
@@ -2894,18 +3342,33 @@ class GUI(QtWidgets.QMainWindow):
             menu.exec_()
 
     def _apply_drt_comp_selection(self, selected_line):
-        """Dim all DRT comparison curves except the selected one; bring selected curve to top."""
+        """Highlight selected DRT curve and dim all other curves."""
+
         if not self._drt_comp_lines:
             return
 
-        for ln in self._drt_comp_lines:
+        highlight_color = "#08306B"
+
+        for line in self._drt_comp_lines:
             try:
-                if ln is selected_line:
-                    ln.set_alpha(1.0)
-                    ln.set_zorder(10)
+                if not hasattr(line, "_drt_original_color"):
+                    line._drt_original_color = line.get_color()
+
+                if not hasattr(line, "_drt_original_linewidth"):
+                    line._drt_original_linewidth = line.get_linewidth()
+
+                if line is selected_line:
+                    line.set_color(highlight_color)
+                    line.set_alpha(1.0)
+                    line.set_linewidth(line._drt_original_linewidth)
+                    line.set_zorder(10)
+
                 else:
-                    ln.set_alpha(0.2)
-                    ln.set_zorder(1)
+                    line.set_color(line._drt_original_color)
+                    line.set_alpha(0.2)
+                    line.set_linewidth(line._drt_original_linewidth)
+                    line.set_zorder(1)
+
             except Exception:
                 pass
 
@@ -2913,18 +3376,31 @@ class GUI(QtWidgets.QMainWindow):
         self._drt_comp_force_redraw()
 
     def _clear_drt_comp_selection(self):
-        """Restore all DRT comparison curves to fully opaque."""
+        """Clear DRT curve selection and restore every curve's original style."""
+
         if not self._drt_comp_lines:
             self._drt_comp_selected = None
             return
 
-        if self._drt_comp_selected is None:
-            return
-
-        for ln in self._drt_comp_lines:
+        for line in self._drt_comp_lines:
             try:
-                ln.set_alpha(1.0)
-                ln.set_zorder(1)
+                original_color = getattr(
+                    line,
+                    "_drt_original_color",
+                    line.get_color()
+                )
+
+                original_linewidth = getattr(
+                    line,
+                    "_drt_original_linewidth",
+                    2.0
+                )
+
+                line.set_color(original_color)
+                line.set_alpha(1.0)
+                line.set_linewidth(original_linewidth)
+                line.set_zorder(1)
+
             except Exception:
                 pass
 
@@ -3258,7 +3734,7 @@ class GUI(QtWidgets.QMainWindow):
             return
 
         key = keys[row] if row < len(keys) else None
-        fname = os.path.basename(key) if key else f"Row {row + 1}"
+        fname = self._display_name_for_key(key) if key else f"Row {row + 1}"
 
         try:
             tau_val = float(xgrid[col])
@@ -3359,6 +3835,12 @@ class GUI(QtWidgets.QMainWindow):
         if vmin == vmax:
             vmax = vmin + 1e-12
 
+        # Clamp both sides for plotting: values below vmin use the exact
+        # color assigned to vmin, while values above vmax use the exact
+        # color assigned to vmax. This prevents contourf from leaving
+        # out-of-range regions white.
+        zmat_for_plot = np.clip(zmat, vmin, vmax)
+
         major_levels = int(self.drt_map_settings.get('major_levels', 10) or 10)
         minor_levels = int(self.drt_map_settings.get('minor_levels', 10) or 10)
         total_levels = max(2, major_levels * minor_levels)
@@ -3396,7 +3878,7 @@ class GUI(QtWidgets.QMainWindow):
             x_edges = self._logspace_edges(xgrid)
             y_edges = np.linspace(0, n_files, n_files + 1)
             m = ax.pcolormesh(
-                x_edges, y_edges, zmat,
+                x_edges, y_edges, zmat_for_plot,
                 cmap=cmap,
                 shading='auto',
                 vmin=vmin,
@@ -3409,12 +3891,12 @@ class GUI(QtWidgets.QMainWindow):
             y_edges = np.arange(n_files + 1, dtype=float)
 
             if n_files == 1:
-                z_edges = np.vstack([zmat[0], zmat[0]])
+                z_edges = np.vstack([zmat_for_plot[0], zmat_for_plot[0]])
             else:
-                z_edges = np.empty((n_files + 1, zmat.shape[1]), dtype=float)
-                z_edges[0, :] = zmat[0, :]
-                z_edges[-1, :] = zmat[-1, :]
-                z_edges[1:-1, :] = 0.5 * (zmat[:-1, :] + zmat[1:, :])
+                z_edges = np.empty((n_files + 1, zmat_for_plot.shape[1]), dtype=float)
+                z_edges[0, :] = zmat_for_plot[0, :]
+                z_edges[-1, :] = zmat_for_plot[-1, :]
+                z_edges[1:-1, :] = 0.5 * (zmat_for_plot[:-1, :] + zmat_for_plot[1:, :])
 
             levels = np.linspace(vmin, vmax, total_levels)
             m = ax.contourf(
@@ -3746,51 +4228,404 @@ class GUI(QtWidgets.QMainWindow):
                             w.writerow([name, tau[i], g[i]])
                 return
 
-    def export_EIS(self):  # callback for exporting the EIS fitting results
+    @staticmethod
+    def _eis_export_safe_name(name):
+        """Return a file-system-safe CSV base name without changing the UI name."""
+        name = str(name or '').strip()
+        if not name:
+            name = 'EIS'
+        for ch in '<>:"/\\|?*':
+            name = name.replace(ch, '_')
+        name = name.rstrip(' .')
+        return name or 'EIS'
 
-        # return None if the users have not conducted any computation
-        if self.data == None:
+    @staticmethod
+    def _eis_export_array(values, size, dtype=float):
+        """Return a fixed-length array padded with NaN values."""
+        out = np.full(int(size), np.nan, dtype=dtype)
+        try:
+            arr = np.asarray(values, dtype=dtype).reshape(-1)
+        except Exception:
+            return out
+        count = min(out.size, arr.size)
+        if count:
+            out[:count] = arr[:count]
+        return out
+
+    def _eis_export_payload(self, key):
+        """Build raw-grid-aligned EIS data for one imported file.
+
+        Raw frequency is used as the shared row grid. Masked, Lin-KK and DRT
+        values are placed at their corresponding raw indices; unavailable or
+        masked positions are left blank in the CSV. This preserves point-wise
+        correspondence while allowing raw and masked datasets to coexist in
+        one table.
+        """
+        entry = self.data_store.get(key)
+        if entry is None:
+            raise ValueError('The file is no longer available.')
+
+        freq0, zre0, zim0, _ = _get_entry_raw_arrays(entry)
+        n_raw = int(freq0.size)
+        if n_raw == 0:
+            raise ValueError('The file contains no EIS points.')
+
+        active_idx = np.asarray(
+            getattr(entry, 'active_raw_indices', np.arange(n_raw)),
+            dtype=int,
+        ).reshape(-1)
+        active_idx = active_idx[(active_idx >= 0) & (active_idx < n_raw)]
+
+        def map_active(values, dtype=float):
+            result = np.full(n_raw, np.nan, dtype=dtype)
+            try:
+                arr = np.asarray(values, dtype=dtype).reshape(-1)
+            except Exception:
+                return result
+            count = min(active_idx.size, arr.size)
+            if count:
+                result[active_idx[:count]] = arr[:count]
+            return result
+
+        masked_re = map_active(getattr(entry, 'Z_prime', []))
+        masked_im = map_active(getattr(entry, 'Z_double_prime', []))
+
+        kk_re = np.full(n_raw, np.nan, dtype=float)
+        kk_im = np.full(n_raw, np.nan, dtype=float)
+        kk_fit_raw = getattr(entry, 'kk_Z_fit_raw', None)
+        if kk_fit_raw is not None:
+            try:
+                kk_complex = np.asarray(kk_fit_raw, dtype=complex).reshape(-1)
+                count = min(n_raw, kk_complex.size)
+                if count:
+                    kk_re[:count] = kk_complex.real[:count]
+                    kk_im[:count] = kk_complex.imag[:count]
+            except Exception:
+                pass
+        elif getattr(entry, 'kk_Z_fit', None) is not None:
+            try:
+                kk_complex = np.asarray(entry.kk_Z_fit, dtype=complex).reshape(-1)
+                count = min(active_idx.size, kk_complex.size)
+                if count:
+                    kk_re[active_idx[:count]] = kk_complex.real[:count]
+                    kk_im[active_idx[:count]] = kk_complex.imag[:count]
+            except Exception:
+                pass
+
+        drt_re = map_active(getattr(entry, 'mu_Z_re', []))
+        drt_im = map_active(getattr(entry, 'mu_Z_im', []))
+
+        drt_res_re_values = getattr(entry, 'res_re', None)
+        drt_res_im_values = getattr(entry, 'res_im', None)
+        if drt_res_re_values is None or drt_res_im_values is None:
+            # BHT compatibility: use the fitted residual arrays available for
+            # that mode instead of exporting shifted/misaligned columns.
+            drt_res_re_values = getattr(entry, 'res_H_re', [])
+            drt_res_im_values = getattr(entry, 'res_H_im', [])
+        drt_res_re = map_active(drt_res_re_values)
+        drt_res_im = map_active(drt_res_im_values)
+
+        kk_res_re = self._eis_export_array(
+            getattr(entry, 'kk_res_re_raw_pct', []), n_raw
+        )
+        kk_res_im = self._eis_export_array(
+            getattr(entry, 'kk_res_im_raw_pct', []), n_raw
+        )
+        if not np.any(np.isfinite(kk_res_re)) and getattr(entry, 'kk_res_re_pct', None) is not None:
+            kk_res_re = map_active(getattr(entry, 'kk_res_re_pct', []))
+        if not np.any(np.isfinite(kk_res_im)) and getattr(entry, 'kk_res_im_pct', None) is not None:
+            kk_res_im = map_active(getattr(entry, 'kk_res_im_pct', []))
+
+        return {
+            'key': key,
+            'name': self._display_name_for_key(key),
+            'freq': np.asarray(freq0, dtype=float),
+            'initial_re': np.asarray(zre0, dtype=float),
+            'initial_im': np.asarray(zim0, dtype=float),
+            'masked_re': masked_re,
+            'masked_im': masked_im,
+            'kk_re': kk_re,
+            'kk_im': kk_im,
+            'drt_re': drt_re,
+            'drt_im': drt_im,
+            'kk_res_re': kk_res_re,
+            'kk_res_im': kk_res_im,
+            'drt_res_re': drt_res_re,
+            'drt_res_im': drt_res_im,
+        }
+
+    @staticmethod
+    def _eis_export_columns(options):
+        """Return grouped CSV column definitions in the requested order."""
+        groups = []
+        if options['freq']:
+            groups.append(('Frequency', [('Freq/Hz', 'freq')]))
+
+        value_components = []
+        if options['z_re']:
+            value_components.append(("Z'/ohm", 're'))
+        if options['z_im']:
+            value_components.append(('Z"/ohm', 'im'))
+
+        residual_components_ohm = []
+        residual_components_pct = []
+        if options['z_re']:
+            residual_components_ohm.append(("Z' residual/ohm", 're'))
+            residual_components_pct.append(("Z' residual/%", 're'))
+        if options['z_im']:
+            residual_components_ohm.append(('Z" residual/ohm', 'im'))
+            residual_components_pct.append(('Z" residual/%', 'im'))
+
+        type_map = [
+            ('initial', 'Initial EIS data', 'initial'),
+            ('masked', 'Masked EIS data', 'masked'),
+            ('lin_kk', 'Lin-KK EIS data', 'kk'),
+            ('drt', 'DRT EIS data', 'drt'),
+        ]
+        for option_key, title, prefix in type_map:
+            if options[option_key] and value_components:
+                groups.append((title, [
+                    (header, f'{prefix}_{component}')
+                    for header, component in value_components
+                ]))
+
+        if options['lin_kk_residual'] and residual_components_pct:
+            groups.append(('Lin-KK Residual', [
+                (header, f'kk_res_{component}')
+                for header, component in residual_components_pct
+            ]))
+        if options['drt_residual'] and residual_components_ohm:
+            groups.append(('DRT Residual', [
+                (header, f'drt_res_{component}')
+                for header, component in residual_components_ohm
+            ]))
+        return groups
+
+    @staticmethod
+    def _eis_export_headers(groups, include_name=False):
+        first = ['File Name'] if include_name else []
+        second = [''] if include_name else []
+        for title, columns in groups:
+            first.append(title)
+            first.extend([''] * (len(columns) - 1))
+            second.extend(header for header, _ in columns)
+        return first, second
+
+    @staticmethod
+    def _eis_export_value(value):
+        try:
+            value = float(value)
+        except Exception:
+            return ''
+        return value if np.isfinite(value) else ''
+
+    def _write_eis_separate_csv(self, path, payload, groups):
+        header_1, header_2 = self._eis_export_headers(groups, include_name=False)
+        with open(path, 'w', newline='', encoding='utf-8-sig') as save_file:
+            writer = csv.writer(save_file)
+            writer.writerow(header_1)
+            writer.writerow(header_2)
+            row_count = int(payload['freq'].size)
+            for row_index in range(row_count):
+                row = []
+                for _, columns in groups:
+                    for _, field in columns:
+                        values = payload.get(field, [])
+                        value = values[row_index] if row_index < len(values) else np.nan
+                        row.append(self._eis_export_value(value))
+                writer.writerow(row)
+
+    def _write_eis_merged_csv(self, path, payloads, groups):
+        block_header_1, block_header_2 = self._eis_export_headers(groups, include_name=True)
+        header_1 = []
+        header_2 = []
+        for payload in payloads:
+            header_1.extend(block_header_1)
+            second = list(block_header_2)
+            second[0] = payload['name']
+            header_2.extend(second)
+
+        block_width = len(block_header_1)
+        max_rows = max(int(payload['freq'].size) for payload in payloads)
+        with open(path, 'w', newline='', encoding='utf-8-sig') as save_file:
+            writer = csv.writer(save_file)
+            writer.writerow(header_1)
+            writer.writerow(header_2)
+            for row_index in range(max_rows):
+                merged_row = []
+                for payload in payloads:
+                    if row_index >= int(payload['freq'].size):
+                        merged_row.extend([''] * block_width)
+                        continue
+                    merged_row.append(payload['name'])
+                    for _, columns in groups:
+                        for _, field in columns:
+                            values = payload.get(field, [])
+                            value = values[row_index] if row_index < len(values) else np.nan
+                            merged_row.append(self._eis_export_value(value))
+                writer.writerow(merged_row)
+
+    def _show_eis_export_dialog(self):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle('Export EIS')
+        dialog.setModal(True)
+        dialog.setMinimumWidth(620)
+
+        root = QtWidgets.QVBoxLayout(dialog)
+        root.setContentsMargins(18, 18, 18, 16)
+        root.setSpacing(12)
+
+        info = QtWidgets.QLabel(
+            'Export files in the same order as the Files panel. '
+            'Unavailable fitted values are exported as blank cells.'
+        )
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+        def add_option_row(title, widgets):
+            box = QtWidgets.QGroupBox(title, dialog)
+            row = QtWidgets.QHBoxLayout(box)
+            row.setContentsMargins(14, 12, 14, 12)
+            row.setSpacing(18)
+            for widget in widgets:
+                row.addWidget(widget)
+            row.addStretch(1)
+            root.addWidget(box)
+            return box
+
+        cb_freq = QtWidgets.QCheckBox('Freq', dialog)
+        cb_z_re = QtWidgets.QCheckBox("Z'", dialog)
+        cb_z_im = QtWidgets.QCheckBox('Z"', dialog)
+        cb_freq.setChecked(True)
+        cb_z_re.setChecked(True)
+        cb_z_im.setChecked(True)
+        add_option_row('EIS data columns', [cb_freq, cb_z_re, cb_z_im])
+
+        cb_initial = QtWidgets.QCheckBox('Initial data', dialog)
+        cb_masked = QtWidgets.QCheckBox('Masked data', dialog)
+        cb_kk = QtWidgets.QCheckBox('Lin-KK fitted data', dialog)
+        cb_drt = QtWidgets.QCheckBox('DRT inversion data', dialog)
+        for checkbox in (cb_initial, cb_masked, cb_kk, cb_drt):
+            checkbox.setChecked(True)
+        add_option_row('EIS data types', [cb_initial, cb_masked, cb_kk, cb_drt])
+
+        cb_drt_res = QtWidgets.QCheckBox('DRT residual', dialog)
+        cb_kk_res = QtWidgets.QCheckBox('Lin-KK residual', dialog)
+        cb_drt_res.setChecked(True)
+        cb_kk_res.setChecked(True)
+        add_option_row('Residuals', [cb_drt_res, cb_kk_res])
+
+        rb_separate = QtWidgets.QRadioButton('Separate', dialog)
+        rb_merged = QtWidgets.QRadioButton('Merged', dialog)
+        rb_separate.setChecked(True)
+        add_option_row('Data format', [rb_separate, rb_merged])
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Cancel,
+            parent=dialog,
+        )
+        export_button = buttons.addButton('Export', QtWidgets.QDialogButtonBox.AcceptRole)
+        export_button.setDefault(True)
+        buttons.rejected.connect(dialog.reject)
+        export_button.clicked.connect(dialog.accept)
+        root.addWidget(buttons)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+
+        return {
+            'freq': cb_freq.isChecked(),
+            'z_re': cb_z_re.isChecked(),
+            'z_im': cb_z_im.isChecked(),
+            'initial': cb_initial.isChecked(),
+            'masked': cb_masked.isChecked(),
+            'lin_kk': cb_kk.isChecked(),
+            'drt': cb_drt.isChecked(),
+            'drt_residual': cb_drt_res.isChecked(),
+            'lin_kk_residual': cb_kk_res.isChecked(),
+            'format': 'merged' if rb_merged.isChecked() else 'separate',
+        }
+
+    def export_EIS(self):
+        """Export configurable EIS datasets for every file in the Files panel."""
+        keys = [key for key in self._get_file_keys_in_ui_order() if key in self.data_store]
+        if not keys:
+            QtWidgets.QMessageBox.information(self, 'Export EIS', 'No EIS files are available.')
             return
 
-        # select path to save the result
-        path, ext = QFileDialog.getSaveFileName(None, "Please directory to save the EIS fitting result",
-                                                "", "CSV files (*.csv);; TXT files (*.txt)")
-        if path == "":  # Check if the path is empty
-            return  # Exitthe function if no path is selected
+        options = self._show_eis_export_dialog()
+        if options is None:
+            return
 
-        if self.data.method == 'BHT':  # save result for BHT
-            with open(path, 'w', newline='') as save_file:
-                writer = csv.writer(save_file)
-                writer.writerow(['s_res_re', self.data.out_scores['s_res_re'][0],
-                                 self.data.out_scores['s_res_re'][1],
-                                 self.data.out_scores['s_res_re'][2]])
-                writer.writerow(['s_res_im', self.data.out_scores['s_res_im'][0],
-                                 self.data.out_scores['s_res_im'][1],
-                                 self.data.out_scores['s_res_im'][2]])
-                writer.writerow(['s_mu_re', self.data.out_scores['s_mu_re']])
-                writer.writerow(['s_mu_im', self.data.out_scores['s_mu_im']])
-                writer.writerow(['s_HD_re', self.data.out_scores['s_HD_re']])
-                writer.writerow(['s_HD_im', self.data.out_scores['s_HD_im']])
-                writer.writerow(['s_JSD_re', self.data.out_scores['s_JSD_re']])
-                writer.writerow(['s_JSD_im', self.data.out_scores['s_JSD_im']])
-                writer.writerow(['freq', 'mu_Z_re', 'mu_Z_im', 'mu_H_re', 'mu_H_im',
-                                 'Z_H_re_band', 'Z_H_im_band', 'Z_H_re_res', 'Z_H_im_res'])
-                # save frequency, the fitted impedance and the residual
-                for n in range(self.data.freq.shape[0]):
-                    writer.writerow([self.data.freq[n], self.data.mu_Z_re[n],
-                                     self.data.mu_Z_im[n], self.data.mu_Z_H_im_agm[n],
-                                     self.data.band_re_agm[n], self.data.band_im_agm[n],
-                                     self.data.res_H_re[n], self.data.res_H_im[n]])
+        groups = self._eis_export_columns(options)
+        if not groups:
+            QtWidgets.QMessageBox.warning(
+                self,
+                'Export EIS',
+                'Please select at least one exportable column. When exporting EIS data or residuals, '
+                'select Z\' and/or Z".',
+            )
+            return
 
-        else:  # save result for simple and bayesian run
-            with open(path, 'w', newline='') as save_file:
-                writer = csv.writer(save_file)
-                writer.writerow(['freq', 'mu_Z_re', 'mu_Z_im', 'Z_re_res', 'Z_im_res'])
-                # save frequency, the fitted impedance and the residual
-                for n in range(self.data.freq.shape[0]):
-                    writer.writerow([self.data.freq[n], self.data.mu_Z_re[n],
-                                     self.data.mu_Z_im[n], self.data.res_re[n],
-                                     self.data.res_im[n]])
+        payloads = []
+        skipped = []
+        for key in keys:
+            try:
+                payloads.append(self._eis_export_payload(key))
+            except Exception as exc:
+                skipped.append(f'{self._display_name_for_key(key)}: {exc}')
+
+        if not payloads:
+            QtWidgets.QMessageBox.warning(
+                self,
+                'Export EIS',
+                'None of the files could be exported.' + ('\n\n' + '\n'.join(skipped) if skipped else ''),
+            )
+            return
+
+        try:
+            if options['format'] == 'separate':
+                directory = QFileDialog.getExistingDirectory(
+                    self,
+                    'Choose directory for separate EIS CSV files',
+                    '',
+                )
+                if not directory:
+                    return
+
+                used_paths = set()
+                for payload in payloads:
+                    base_name = self._eis_export_safe_name(payload['name'])
+                    candidate = os.path.join(directory, base_name + '.csv')
+                    suffix = 2
+                    normalized = os.path.normcase(os.path.abspath(candidate))
+                    while normalized in used_paths or os.path.exists(candidate):
+                        candidate = os.path.join(directory, f'{base_name}_{suffix}.csv')
+                        normalized = os.path.normcase(os.path.abspath(candidate))
+                        suffix += 1
+                    self._write_eis_separate_csv(candidate, payload, groups)
+                    used_paths.add(normalized)
+
+                message = f'Exported {len(payloads)} EIS CSV file(s) to {directory}'
+            else:
+                path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    'Save merged EIS data',
+                    'EIS_merged.csv',
+                    'CSV files (*.csv)',
+                )
+                if not path:
+                    return
+                if not path.lower().endswith('.csv'):
+                    path += '.csv'
+                self._write_eis_merged_csv(path, payloads, groups)
+                message = f'Exported merged EIS data to {path}'
+
+            if skipped:
+                message += f' | {len(skipped)} file(s) skipped'
+            self.statusBar().showMessage(message, 5000)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, 'Export EIS failed', str(exc))
 
     def export_fig(self):  # export the figures as png
 
@@ -3934,6 +4769,7 @@ class GUI(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         if not self._project_dirty:
+            self._shutdown_fit_process_pool(cancel=True, terminate=True)
             event.accept()
             return
 
@@ -3942,9 +4778,11 @@ class GUI(QtWidgets.QMainWindow):
             event.ignore()
             return
         if reply == QtWidgets.QMessageBox.Discard:
+            self._shutdown_fit_process_pool(cancel=True, terminate=True)
             event.accept()
             return
         if self.save_project_callback():
+            self._shutdown_fit_process_pool(cancel=True, terminate=True)
             event.accept()
         else:
             event.ignore()
@@ -4483,6 +5321,8 @@ class Figure_Canvas(FigureCanvas):
                 continue
 
             line, = self.axes.semilogx(x, y, color=color, linewidth=2, picker=5)
+            line._drt_original_color = color
+            line._drt_original_linewidth = 2.0
             self._drt_comp_lines.append(line)
             if key is not None:
                 try:
@@ -4549,6 +5389,7 @@ class Figure_Canvas(FigureCanvas):
 
 if __name__ == "__main__":  # starting the GUI when users run this file
 
+    mp.freeze_support()
     app = QtWidgets.QApplication(sys.argv)
     MainWindow = GUI()
     MainWindow.show()
@@ -4778,7 +5619,7 @@ def _refactor_ui_layout(self) -> None:
     try:
         _set_label_style_clean(self)
         allow = set()
-        for name in ("RBF_frame", "settings_layout", "run_layout", "Peak_analysis_frame", "export_frame"):
+        for name in ("project_frame", "RBF_frame", "settings_layout", "run_layout", "Peak_analysis_frame", "export_frame"):
             gb = getattr(self.ui, name, None)
             if isinstance(gb, QtWidgets.QGroupBox):
                 allow.add(gb)
@@ -4834,6 +5675,7 @@ def _rebuild_sidebar_with_forms(self) -> None:
     vbox.setSpacing(12)
 
     groups = [
+        getattr(self.ui, "project_frame", None),
         getattr(self.ui, "settings_layout", None),
         getattr(self.ui, "RBF_frame", None),
         getattr(self.ui, "KK_frame", None),
@@ -4855,6 +5697,8 @@ def _rebuild_sidebar_with_forms(self) -> None:
     host.setMaximumWidth(600)
     host.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
 
+    if hasattr(self.ui, "project_frame"):
+        _layout_project_group(self)
     if hasattr(self.ui, "settings_layout"):
         _layout_settings_group(self)
     if hasattr(self.ui, "RBF_frame"):
@@ -5144,60 +5988,8 @@ def _layout_peak_group(self) -> None:
     grid.addLayout(btn_row, 2, 1)
 
 
-def _layout_export_group(self) -> None:
-    gb = self.ui.export_frame
-    _set_label_style_clean(gb)
-    _clear_layout_widget(gb)
-
-    grid = QtWidgets.QGridLayout(gb)
-    grid.setContentsMargins(16, 10, 16, 14)
-    grid.setHorizontalSpacing(16)
-    grid.setVerticalSpacing(8)
-    grid.setColumnStretch(0, 1)
-    grid.setColumnStretch(1, 0)
-
-    # 动态创建 Open / Save 两个项目按钮
-    if not hasattr(self.ui, "open_project_label"):
-        self.ui.open_project_label = QtWidgets.QLabel("Open Project", gb)
-    if not hasattr(self.ui, "save_project_label"):
-        self.ui.save_project_label = QtWidgets.QLabel("Save Project", gb)
-
-    if not hasattr(self.ui, "open_project_button"):
-        self.ui.open_project_button = QtWidgets.QPushButton("Open", gb)
-    if not hasattr(self.ui, "save_project_button"):
-        self.ui.save_project_button = QtWidgets.QPushButton("Save", gb)
-
-    # 隐藏之前残留的 Project / Save As
-    for name in [
-        "project_title_label",
-        "save_as_project_label",
-        "save_as_project_button",
-    ]:
-        w = getattr(self.ui, name, None)
-        if w is not None:
-            try:
-                w.hide()
-            except Exception:
-                pass
-
-    # 只连接一次
-    if not getattr(self, "_project_buttons_connected", False):
-        self.ui.open_project_button.clicked.connect(self.open_project_callback)
-        self.ui.save_project_button.clicked.connect(self.save_project_callback)
-        self._project_buttons_connected = True
-
-    rows = [
-        (self.ui.export_DRT_label, self.ui.export_DRT_button),
-        (self.ui.export_EIS_label, self.ui.export_EIS_button),
-        (self.ui.export_fig_label, self.ui.export_fig_button),
-        (self.ui.open_project_label, self.ui.open_project_button),
-        (self.ui.save_project_label, self.ui.save_project_button),
-    ]
-
-    keep = {lab for lab, btn in rows}
-    _hide_unmanaged_children(gb, keep)
-
-    export_btn_qss = """
+def _card_button_style():
+    return """
     QPushButton {
         background: #FFFFFF;
         border: 1px solid #D2D2D7;
@@ -5217,30 +6009,66 @@ def _layout_export_group(self) -> None:
     }
     """
 
+
+def _layout_two_column_card(gb, rows):
+    _set_label_style_clean(gb)
+    _clear_layout_widget(gb)
+
+    grid = QtWidgets.QGridLayout(gb)
+    grid.setContentsMargins(16, 10, 16, 14)
+    grid.setHorizontalSpacing(16)
+    grid.setVerticalSpacing(8)
+    grid.setColumnStretch(0, 1)
+    grid.setColumnStretch(1, 0)
+
+    keep = {lab for lab, _ in rows}
+    _hide_unmanaged_children(gb, keep)
+
     button_w = 110
     button_h = 28
+    button_style = _card_button_style()
+    for row, (label, button) in enumerate(rows):
+        label.show()
+        button.show()
+        label.setStyleSheet('background: transparent;')
+        label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        label.setFixedHeight(button_h)
+        label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
-    for row, (lab, btn) in enumerate(rows):
-        lab.show()
-        btn.show()
-
-        lab.setStyleSheet("background: transparent;")
-        lab.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        lab.setFixedHeight(button_h)
-        lab.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-
-        btn.setFixedSize(button_w, button_h)
-        btn.setMinimumSize(button_w, button_h)
-        btn.setMaximumSize(button_w, button_h)
-        btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        btn.setStyleSheet(export_btn_qss)
+        button.setFixedSize(button_w, button_h)
+        button.setMinimumSize(button_w, button_h)
+        button.setMaximumSize(button_w, button_h)
+        button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        button.setStyleSheet(button_style)
 
         grid.setRowMinimumHeight(row, button_h)
-        grid.setRowStretch(row, 0)
+        grid.addWidget(label, row, 0)
+        grid.addWidget(button, row, 1, alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
-        grid.addWidget(lab, row, 0)
-        grid.addWidget(btn, row, 1, alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
+def _layout_project_group(self) -> None:
+    gb = self.ui.project_frame
+    rows = [
+        (self.ui.open_project_label, self.ui.open_project_button),
+        (self.ui.save_project_label, self.ui.save_project_button),
+    ]
+    for name in ('save_project_as_label', 'save_project_as_button'):
+        widget = getattr(self.ui, name, None)
+        if widget is not None:
+            widget.hide()
+    self.ui.save_project_button.setToolTip('Right-click to choose Save Project As...')
+    _layout_two_column_card(gb, rows)
+
+
+def _layout_export_group(self) -> None:
+    gb = self.ui.export_frame
+    self.ui.export_EIS_label.setText('EIS')
+    rows = [
+        (self.ui.export_DRT_label, self.ui.export_DRT_button),
+        (self.ui.export_EIS_label, self.ui.export_EIS_button),
+        (self.ui.export_fig_label, self.ui.export_fig_button),
+    ]
+    _layout_two_column_card(gb, rows)
 
 def _replace_show_buttons_with_tabs(self) -> None:
     bar = getattr(self.ui, "show_layout", None)
@@ -5249,7 +6077,7 @@ def _replace_show_buttons_with_tabs(self) -> None:
 
     btn_map = [
         ("EIS Data", getattr(self.ui, "show_EIS", None)),
-        ("K-K Residual", getattr(self.ui, "show_KK_res", None)),
+        ("Lin-KK Residual", getattr(self.ui, "show_KK_res", None)),
         ("DRT Residual", getattr(self.ui, "show_re_res", None)),
         ("DRT", getattr(self.ui, "show_DRT", None)),
         ("DRT comparison", getattr(self.ui, "show_DRT_comp", None)),
@@ -5530,6 +6358,7 @@ except Exception:
 
 
 def launch_gui():
+    mp.freeze_support()
     # High DPI attributes must be set before QApplication is created.
     try:
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
