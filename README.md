@@ -1,10 +1,10 @@
-# SuperDRTtools V1.1
+# SuperDRTtools V1.2
 
 <div align="center">
 
-**A modern GUI toolbox for DRT, KK validation, masking, and EIS quality assessment**
+**A modern GUI toolbox for DRT analysis, K-K validation, EIS masking, comparison, mapping, and batch processing**
 
-*Built for electrochemical impedance spectroscopy (EIS) analysis with an intuitive multi-file workflow.*
+*Designed for practical electrochemical impedance spectroscopy workflows with multi-file analysis, project management, and flexible data export.*
 
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Python-blue)
 ![GUI](https://img.shields.io/badge/interface-PyQt5-2C7BE5)
@@ -17,19 +17,9 @@
 
 ## Overview
 
-**SuperDRTtools** is an enhanced GUI toolbox for analyzing **electrochemical impedance spectroscopy (EIS)** data via the **distribution of relaxation times (DRT)** framework.
+**SuperDRTtools** is an enhanced graphical toolbox for analyzing **electrochemical impedance spectroscopy (EIS)** data using the **distribution of relaxation times (DRT)** framework. It extends the original pyDRTtools workflow with multi-file import, Kramers-Kronig validation, masking, multiprocessing-based batch fitting, project-level saving and loading, interactive DRT comparison, DRT maps, and configurable EIS export.
 
-It extends the original pyDRTtools workflow with a more practical desktop-oriented experience for real experimental datasets, including:
-
-- multi-file import and batch fitting
-- Kramers–Kronig (K-K) validation based on `linKK`
-- residual-aware EIS inspection
-- point masking for suspicious data
-- DRT comparison and DRT map visualization
-- Hilbert-transform-based quality scoring
-- simple and Bayesian DRT workflows
-
-The goal of SuperDRTtools is not only to compute DRT, but also to make **data quality control, exception handling, and batch analysis** much easier in daily research use.
+The software is intended to make routine EIS analysis more efficient by combining data-quality inspection, fitting, visualization, comparison, and export in a single desktop workflow.
 
 ---
 
@@ -39,40 +29,44 @@ The goal of SuperDRTtools is not only to compute DRT, but also to make **data qu
 <tr>
 <td width="50%" valign="top">
 
-### DRT workflows
+### DRT and fitting
+- Simple, Bayesian, and Hilbert-transform workflows
 - Tikhonov-based DRT computation
-- Bayesian credible-interval workflow
-- Peak analysis / deconvolution tools
-- Multiple parameter-selection strategies
+- Peak analysis and deconvolution
+- Fit One and multiprocessing-based Fit All
+- Live fitting progress in the status bar
 
 </td>
 <td width="50%" valign="top">
 
-### Data-quality workflows
-- K-K validation with `linKK`
+### EIS quality control
+- K-K validation using `linKK`
 - K-K residual visualization
-- Residual-aware point highlighting
-- Manual and rule-based masking
+- Manual, box-selection, and rule-based masking
+- Apply masking criteria to one file or all files
+- Residual-aware EIS inspection
 
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
 
-### Practical GUI features
-- Multi-file list and status tracking
-- Fit one / fit all workflows
-- DRT comparison overlay
-- DRT heatmap (DRT Map)
+### Multi-file workflow
+- Multi-file `.csv` / `.txt` import
+- Drag-and-drop support
+- Automatic handling of common impedance-sign conventions
+- File reordering, status tracking, and renaming
+- Project open, save, overwrite, and save-as workflows
 
 </td>
 <td width="50%" valign="top">
 
-### Inspection & export
-- EIS / magnitude / phase / Re / Im views
-- DRT residual visualization
-- Figure export
-- DRT and EIS result export
+### Visualization and export
+- EIS, magnitude, phase, real, and imaginary views
+- DRT residual, DRT comparison, and DRT Map
+- Linked file/curve selection in DRT comparison
+- Configurable DRT and EIS data export
+- Separate or merged CSV output
 
 </td>
 </tr>
@@ -85,55 +79,80 @@ The goal of SuperDRTtools is not only to compute DRT, but also to make **data qu
 ### Main interface
 ![Main UI](docs/images/main-ui-placeholder.png)
 
-### EIS Data with K-K fit / residual-aware points / masking
+### EIS data, K-K fitting, residual inspection, and masking
 ![EIS View](docs/images/eis-view-placeholder.png)
 
-### DRT comparison and DRT map
-![DRT Views](docs/images/drt-views-comparison.png)
-![DRT Views2](docs/images/drt-views-MAP.png)
+### DRT comparison and DRT Map
+![DRT Comparison](docs/images/drt-views-comparison.png)
+![DRT Map](docs/images/drt-views-MAP.png)
 
 ---
 
-## What SuperDRTtools can do
+## Main features
 
-### 1. Analyze EIS using DRT
-SuperDRTtools provides a Python GUI for computing the **distribution of relaxation times (DRT)** from impedance spectra. It supports classical regularized DRT workflows as well as Bayesian inference routes.
+### EIS import and file management
 
-### 2. Run K-K validation before interpretation
-The software includes a **Kramers–Kronig validation** workflow using `linKK`, allowing users to inspect whether imported EIS data are sufficiently self-consistent before DRT interpretation.
+- Import multiple EIS files in one session.
+- Support common `.csv` and `.txt` layouts.
+- Drag files directly into the interface.
+- Automatically normalize common `Z''` / `-Z''` input conventions.
+- Reorder spectra in the Files panel.
+- Rename the displayed file name from the right-click menu without changing the source file on disk.
 
-### 3. Inspect suspicious points directly in the EIS plot
-After K-K analysis, the **EIS Data** view can be used to inspect raw experimental points together with K-K information. Suspicious points can be visually flagged and masked for subsequent DRT fitting.
+### Lin-KK validation and masking
 
-### 4. Work with multiple files efficiently
-Instead of handling only one spectrum at a time, SuperDRTtools supports **multi-file import**, file ordering, fit-status tracking, batch fitting, DRT comparison, and DRT map visualization.
+- Run Kramers-Kronig validation using `linKK`.
+- Inspect K-K fitted data and residuals.
+- Mask individual points or select multiple points from the EIS plot.
+- Apply frequency-range and K-K residual-threshold rules to the current file or all imported files.
+- Clear masks for one file or all files.
 
-### 5. Evaluate data quality with Hilbert-transform tools
-The Hilbert-transform / Bayesian quality-assessment functionality from the original project is preserved for scoring EIS consistency and related regression outputs.
+### DRT fitting
+
+- Run Simple DRT, Bayesian DRT, Hilbert Transform, and peak-analysis workflows.
+- Fit one selected spectrum or fit multiple spectra in parallel.
+- Fit All uses multiprocessing so independent spectra can be processed concurrently.
+- Solver output is suppressed during batch fitting to keep the console readable.
+- The bottom status bar reports completed, remaining, skipped, and failed fitting tasks.
+
+### DRT comparison
+
+- Overlay DRT results from multiple files.
+- Click a curve or select its file in the Files panel to highlight the corresponding result.
+- The selected curve is shown in `#67001F`, while the remaining curves are faded without changing line width.
+
+### DRT Map
+
+- Display multi-file DRT results as a two-dimensional map.
+- Preserve the ordering of spectra shown in the Files panel.
+- Values above the configured maximum use the maximum color.
+- Values below the configured minimum use the minimum color instead of white.
+
+### Project management
+
+The Project card provides a simple save/load workflow:
+
+- **Open Project** loads a saved SuperDRTtools project.
+- **Save Project** creates a project when the current session has not yet been saved.
+- When a project is already open, **Save Project** overwrites the current project.
+- Right-click the Save button to use **Save Project As...** and preserve a different analysis state.
+- Unsaved changes are indicated in the window title and are checked before closing or opening another project.
+
+### EIS export
+
+The EIS export dialog supports configurable output:
+
+- Select exported columns: `Freq`, `Z'`, and `Z''`.
+- Select data types: initial data, masked data, Lin-KK fitted data, and DRT reconstructed data.
+- Optionally export Lin-KK and DRT residuals.
+- Use **Separate** mode to create one CSV per spectrum.
+- Use **Merged** mode to combine multiple spectra into one CSV using the displayed file names from the Files panel.
+- Exported arrays are aligned to the original frequency sequence; unavailable or masked values are left blank.
 
 ---
 
-## Current feature set
+## Available views
 
-### Core analysis modes
-- Simple DRT run
-- Bayesian DRT run
-- Hilbert Transform run
-- Peak analysis
-
-### K-K workflow
-- K-K validation using `linKK`
-- K-K residual plot
-- K-K fit overlay in EIS Data
-- Residual-aware point coloring
-
-### EIS masking workflow
-- Manual point masking from EIS Data
-- Box-selection for multiple points
-- Frequency-range / residual-threshold masking rules
-- Masked points shown with reduced opacity
-
-### Visualization
 - EIS Data
 - K-K Residual
 - Magnitude
@@ -146,29 +165,21 @@ The Hilbert-transform / Bayesian quality-assessment functionality from the origi
 - DRT Map
 - EIS Score
 
-### Multi-file workflow
-- Import multiple `.csv` / `.txt` files
-- File list with fitted / unfitted status
-- Fit One / Fit All
-- Reorder spectra in the file list
-- Batch-oriented visualization order
-
 ---
 
-## Recommended analysis logic
+## Recommended workflow
 
-A practical workflow for impedance analysis in SuperDRTtools is:
+1. Import one or more EIS datasets.
+2. Check the inductance setting and input convention.
+3. Run K-K validation.
+4. Inspect K-K residuals and suspicious points in **EIS Data**.
+5. Mask abnormal points when necessary.
+6. Re-run K-K validation after changing the retained data.
+7. Perform DRT fitting on the retained EIS data.
+8. Compare spectra using DRT comparison or DRT Map.
+9. Save the project and export the required DRT or EIS results.
 
-1. **Import EIS data**
-2. Adjust **Inductance** handling if needed
-3. Run **K-K validation**
-4. Inspect K-K residuals and suspicious points in **EIS Data**
-5. Mask obvious abnormal points if necessary
-6. Re-run **K-K validation** if you want updated residuals after masking
-7. Perform **DRT fitting using the remaining raw data**
-
-### Important note
-SuperDRTtools is configured so that **DRT fitting is performed on the current raw / retained EIS data**, not on K-K-fitted data. K-K is used as a **validation and inspection step**, not as the default DRT input replacement.
+> **Important:** DRT fitting uses the current retained EIS data. Lin-KK fitting is used for validation and inspection; it does not replace the DRT input by default.
 
 ---
 
@@ -176,12 +187,10 @@ SuperDRTtools is configured so that **DRT fitting is performed on the current ra
 
 ### Requirements
 
-To install and run SuperDRTtools, you need:
-
 - Python >= 3
 - A desktop environment capable of running PyQt5
 
-### Recommended environment setup (Anaconda)
+### Recommended Anaconda environment
 
 ```bash
 conda create --name SuperDRTtools python=3.10 pip ipython pandas matplotlib scikit-learn spyder
@@ -189,15 +198,13 @@ conda activate SuperDRTtools
 pip install cvxopt PyQt5 impedance pyinstaller
 ```
 
-If your local package structure requires it, also make sure the project dependencies used by the original pyDRTtools codebase are installed in the same environment.
+Install any additional dependencies required by the original pyDRTtools modules in the same environment.
 
 ---
 
 ## Quick start
 
-### Run from source
-
-From the project root:
+Run the application from the project root:
 
 ```bash
 python launch.py
@@ -207,8 +214,6 @@ python launch.py
 
 ## Project structure
 
-A typical project layout is expected to look like this:
-
 ```text
 SuperDRTtools/
 ├─ launch.py
@@ -216,6 +221,7 @@ SuperDRTtools/
 │  ├─ __init__.py
 │  ├─ GUI.py
 │  ├─ layout.py
+│  ├─ project_io.py
 │  ├─ basics.py
 │  ├─ parameter_selection.py
 │  ├─ runs.py
@@ -230,33 +236,27 @@ SuperDRTtools/
 
 ## Packaging to EXE
 
-You can package SuperDRTtools into a Windows executable using **PyInstaller**.
-
-### Basic command
+SuperDRTtools can be packaged as a Windows executable with PyInstaller:
 
 ```bash
 python -m PyInstaller --noconfirm --clean --windowed --add-data "launchImg/launch.png;launchImg" --splash launchImg\launch.png --onefile --name SuperDRTtools launch.py
 ```
 
+When using multiprocessing-based Fit All in a packaged Windows application, keep the application entry point protected by the standard `if __name__ == "__main__":` block.
+
 ---
 
 ## User manual
 
-For detailed usage guidance, installation notes, and background information, please consult the user manual:
+For detailed usage guidance, installation notes, and background information, see:
 
-- [manual](docs/manual/pyDRTtools_manual.pdf)
+- [SuperDRTtools manual](docs/manual/pyDRTtools_manual.pdf)
 
 ---
 
-## Why this project may be useful
+## Why use SuperDRTtools?
 
-SuperDRTtools is designed for users who want more than a minimal DRT GUI. It is especially useful if you need to:
-
-- inspect and clean real experimental EIS datasets
-- compare many impedance spectra efficiently
-- combine K-K validation with DRT interpretation
-- work with Bayesian and HT-based quality-assessment workflows
-- prepare figures and exported results for research use
+SuperDRTtools is designed for researchers who need to inspect, fit, compare, organize, save, and export real EIS datasets within one interface. It is especially useful for multi-spectrum experiments where data validation, masking, batch DRT fitting, consistent visualization, and reproducible project states are required.
 
 ---
 
