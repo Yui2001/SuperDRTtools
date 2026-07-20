@@ -2,110 +2,18 @@
 __authors__ = 'Francesco Ciucci, Baptiste Py, Ting Hei Wan, Adeleke Maradesa, DongXu Ye'
 
 __date__ = '4th October 2024'
-# FIT_ALL_MULTIPROCESS_PATCH_20260720
+# FIT_ALL_MULTIPROCESS_BACKEND_SPLIT_20260720
 
 import csv
 import os
 import copy
 import hashlib
-import sys
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager, nullcontext, redirect_stdout, redirect_stderr
+import sys
 from types import SimpleNamespace
 
 from numpy import absolute, angle
 from PyQt5 import QtGui, QtWidgets, QtCore
-
-# --- Parallel fitting performance notes ---
-# Many numerical solvers (OpenBLAS/MKL/OpenMP) will use multiple CPU threads
-# *inside a single fit*. If each fit already uses most/all cores, running
-# multiple fits concurrently (Python threads) won't reduce total wall time.
-# We therefore (optionally) limit native threadpools per fit during "Fit All"
-# so that multiple fits can truly run side-by-side across cores.
-try:
-    from threadpoolctl import threadpool_limits as _threadpool_limits
-except Exception:
-    _threadpool_limits = None
-
-
-def _native_thread_limit_ctx(n_threads: int):
-    """Context manager to limit BLAS/OMP thread pools (best-effort)."""
-    if _threadpool_limits is None:
-        return nullcontext()
-    try:
-        return _threadpool_limits(limits=int(max(1, n_threads)))
-    except Exception:
-        return nullcontext()
-
-
-@contextmanager
-def _silence_child_process_output():
-    """Silence Python and native stdout/stderr inside a Fit All child process.
-
-    redirect_stdout alone does not catch every C-extension write. The file
-    descriptor redirection also suppresses CVXOPT/native solver output.
-    """
-    devnull = open(os.devnull, 'w')
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    saved_fds = {}
-
-    try:
-        try:
-            old_stdout.flush()
-        except Exception:
-            pass
-        try:
-            old_stderr.flush()
-        except Exception:
-            pass
-
-        for fd in (1, 2):
-            try:
-                saved_fds[fd] = os.dup(fd)
-                os.dup2(devnull.fileno(), fd)
-            except Exception:
-                pass
-
-        sys.stdout = devnull
-        sys.stderr = devnull
-
-        with redirect_stdout(devnull), redirect_stderr(devnull):
-            yield
-
-    finally:
-        try:
-            devnull.flush()
-        except Exception:
-            pass
-
-        for fd, saved_fd in saved_fds.items():
-            try:
-                os.dup2(saved_fd, fd)
-            except Exception:
-                pass
-            try:
-                os.close(saved_fd)
-            except Exception:
-                pass
-
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        try:
-            devnull.close()
-        except Exception:
-            pass
-
-
-def _disable_cvxopt_progress():
-    """Disable CVXOPT iteration tables in the current process."""
-    try:
-        from cvxopt import solvers as _cvx_solvers
-        _cvx_solvers.options['show_progress'] = False
-    except Exception:
-        pass
-
 
 def apply_flat_theme(app: QtWidgets.QApplication) -> None:
     try:
@@ -119,7 +27,6 @@ def apply_flat_theme(app: QtWidgets.QApplication) -> None:
 
     qss = """
     QWidget {
-        background: #F5F5F7;
         color: #1D1D1F;
         font-family: Arial;
         font-size: 11pt;
@@ -322,6 +229,7 @@ from PyQt5.QtWidgets import QFileDialog
 from . import layout
 #
 from .runs import *
+from .fit_parallel import FitProcessManager, run_fit_entry
 #
 from impedance.validation import linKK
 import matplotlib as mpl
@@ -428,125 +336,6 @@ class ExternalFileDropFilter(QtCore.QObject):
 
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-
-
-class _FitWorkerSignals(QtCore.QObject):
-    """Signals for background fit worker."""
-    finished = QtCore.pyqtSignal(str, object, object)  # key, fitted_entry, signature
-    error = QtCore.pyqtSignal(str, str)  # key, error message
-
-
-class _FitWorker(QtCore.QRunnable):
-    """Run one fit task in a worker thread (no UI access)."""
-
-    def __init__(self, key: str, entry, mode: str, params: dict, signature):
-        super().__init__()
-        self.key = key
-        self.entry = entry
-        self.mode = mode
-        self.params = params or {}
-        self.signature = signature
-        self.signals = _FitWorkerSignals()
-        try:
-            # allow Qt to delete runnable automatically after execution
-            self.setAutoDelete(True)
-        except Exception:
-            pass
-
-    def run(self):
-        try:
-            # Limit native BLAS/OpenMP threads per fit so multiple fits can
-            # actually run in parallel across CPU cores.
-            n_native = int((self.params or {}).get('native_threads', 1) or 1)
-            with _native_thread_limit_ctx(n_native):
-                entry = self._run_fit(self.entry, self.mode, self.params)
-            self.signals.finished.emit(self.key, entry, self.signature)
-        except Exception as e:
-            self.signals.error.emit(self.key, str(e))
-
-    @staticmethod
-    def _run_fit(entry, mode: str, params: dict):
-        """Pure computation. Must NOT touch Qt/UI objects."""
-        if entry is None:
-            raise ValueError("Empty entry")
-
-        if mode == 'simple':
-            source_entry = entry
-            entry, used_kk = _prepare_entry_for_drt_fit(entry)
-            entry = simple_run(
-                entry,
-                rbf_type=params['rbf_type'],
-                data_used=params['data_used'],
-                induct_used=params['induct_used'],
-                der_used=params['der_used'],
-                cv_type=params['cv_type'],
-                reg_param=params['reg_param'],
-                shape_control=params['shape_control'],
-                coeff=params['coeff'],
-            )
-            # compute lambda_value like original logic
-            if params['cv_type'] == 'custom':
-                entry.lambda_value = params['reg_param']
-            else:
-                entry.lambda_value = basics.optimal_lambda(
-                    entry.A_re, entry.A_im, entry.b_re, entry.b_im,
-                    entry.M, params['data_used'], params['induct_used'], -3, params['cv_type']
-                )
-            return _finalize_fitted_entry_for_display(entry, source_entry, used_kk)
-
-        if mode == 'bayesian':
-            source_entry = entry
-            entry, used_kk = _prepare_entry_for_drt_fit(entry)
-            entry = Bayesian_run(
-                entry,
-                rbf_type=params['rbf_type'],
-                data_used=params['data_used'],
-                induct_used=params['induct_used'],
-                der_used=params['der_used'],
-                cv_type=params['cv_type'],
-                reg_param=params['reg_param'],
-                shape_control=params['shape_control'],
-                coeff=params['coeff'],
-                NMC_sample=params['sample_number'],
-            )
-            return _finalize_fitted_entry_for_display(entry, source_entry, used_kk)
-
-        if mode == 'BHT':
-            entry = BHT_run(
-                entry,
-                params['rbf_type'],
-                params['der_used'],
-                params['shape_control'],
-                params['coeff'],
-            )
-            return entry
-
-        raise ValueError(f"Unknown mode: {mode}")
-
-
-def _fit_process_task(key: str, entry, mode: str, params: dict, signature):
-    """Run one complete fit in a separate Python process.
-
-    This is a module-level function so Windows ``spawn`` can pickle/import it.
-    Each process uses one native numerical thread; parallelism comes from
-    multiple independent file-fitting processes.
-    """
-    params = dict(params or {})
-    n_native = int(params.get('native_threads', 1) or 1)
-
-    # Avoid nested BLAS/OpenMP parallelism inside every worker process.
-    os.environ['OMP_NUM_THREADS'] = str(max(1, n_native))
-    os.environ['OPENBLAS_NUM_THREADS'] = str(max(1, n_native))
-    os.environ['MKL_NUM_THREADS'] = str(max(1, n_native))
-    os.environ['NUMEXPR_NUM_THREADS'] = str(max(1, n_native))
-
-    _disable_cvxopt_progress()
-
-    with _silence_child_process_output():
-        with _native_thread_limit_ctx(n_native):
-            fitted_entry = _FitWorker._run_fit(entry, mode, params)
-
-    return key, fitted_entry, signature
 
 
 def _get_entry_raw_arrays(entry):
@@ -861,48 +650,6 @@ def _entry_has_valid_kk(entry) -> bool:
         return False
 
 
-def _prepare_entry_for_drt_fit(entry):
-    """Return a deep-copied entry for DRT fitting using the current raw/masked data only."""
-    if entry is None:
-        raise ValueError('Empty entry')
-    fit_entry = copy.deepcopy(entry)
-    fit_entry.fit_data_source = 'raw'
-    return fit_entry, False
-
-
-def _finalize_fitted_entry_for_display(fitted_entry, source_entry, used_kk: bool):
-    """Keep the current raw/masked EIS data for display after DRT fitting."""
-    if fitted_entry is None:
-        return fitted_entry
-    try:
-        fitted_entry.fit_data_source = 'raw'
-    except Exception:
-        pass
-    if source_entry is None:
-        return fitted_entry
-    try:
-        fitted_entry.freq = np.asarray(source_entry.freq, dtype=float).copy()
-        fitted_entry.Z_prime = np.asarray(source_entry.Z_prime, dtype=float).copy()
-        fitted_entry.Z_double_prime = np.asarray(source_entry.Z_double_prime, dtype=float).copy()
-        fitted_entry.Z_exp = np.asarray(source_entry.Z_exp, dtype=complex).copy()
-        fitted_entry.tau = np.asarray(source_entry.tau, dtype=float).copy()
-        fitted_entry.tau_fine = np.asarray(source_entry.tau_fine, dtype=float).copy()
-    except Exception:
-        pass
-    for attr in ('freq_0', 'Z_prime_0', 'Z_double_prime_0', 'Z_exp_0',
-                 'mask_manual_raw', 'mask_auto_raw', 'mask_total_raw', 'mask_settings',
-                 'visible_keep_raw', 'active_raw_indices',
-                 'kk_valid', 'kk_c', 'kk_max_m', 'kk_fit_type', 'kk_selected_m', 'kk_mu', 'kk_tau',
-                 'kk_R0', 'kk_R', 'kk_L', 'kk_Z_fit', 'kk_res_re_pct', 'kk_res_im_pct',
-                 'kk_res_re_raw_pct', 'kk_res_im_raw_pct', 'kk_Z_fit_raw', 'kk_signature'):
-        try:
-            if hasattr(source_entry, attr):
-                setattr(fitted_entry, attr, copy.deepcopy(getattr(source_entry, attr)))
-        except Exception:
-            pass
-    return fitted_entry
-
-
 class GUI(QtWidgets.QMainWindow):
     def __init__(self):
 
@@ -1040,11 +787,11 @@ class GUI(QtWidgets.QMainWindow):
         if hasattr(self.ui, 'run_kkr_button'):
             self.ui.run_kkr_button.clicked.connect(self.kk_run_callback)
 
-        # Process-based parallel fitting (Fit All).
-        # A fresh executor is created for each Fit All run and shut down when done.
-        self._fit_executor = None
-        self._fit_futures = {}
+        # Process-based Fit All is implemented in fit_parallel.py.
+        self._fit_process_manager = FitProcessManager()
         self._fit_worker_count = 0
+        self._fit_initial_worker_count = 0
+        self._fit_process_note = ''
         self._fit_poll_timer = QtCore.QTimer(self)
         self._fit_poll_timer.setInterval(100)
         self._fit_poll_timer.timeout.connect(self._poll_fit_processes)
@@ -2274,66 +2021,19 @@ class GUI(QtWidgets.QMainWindow):
                 break
 
     def _fit_key(self, key: str, mode: str, signature=None, update_ui: bool = False):
-        """Run the selected mode on a specific file (by key) and store results."""
+        """Run the selected mode on one file and store the result."""
         if key not in self.data_store:
             return
 
-        entry = self.data_store[key]
         signature = signature if signature is not None else self._current_fit_signature(mode)
+        params = self._build_fit_params(mode)
+        entry = run_fit_entry(self.data_store[key], mode, params)
 
-        if mode == 'simple':
-            source_entry = entry
-            entry, used_kk = _prepare_entry_for_drt_fit(entry)
-            rbf_type = str(self.ui.discre_choice.currentText())
-            data_used = str(self.ui.data_used_choice.currentText())
-            induct_used = int(self.ui.induct_choice.currentIndex())
-            der_used = str(self.ui.der_choice.currentText())
-            cv_type = str(self.ui.lambda_choice.currentText())
-            reg_param = float(self.ui.reg_param_entry.text())
-            shape_control = str(self.ui.shape_control_choice.currentText())
-            coeff = float(self.ui.FWHM_entry.text())
-
-            entry = simple_run(entry, rbf_type=rbf_type, data_used=data_used, induct_used=induct_used,
-                               der_used=der_used, cv_type=cv_type, reg_param=reg_param,
-                               shape_control=shape_control, coeff=coeff)
-
-            if cv_type == 'custom':
-                entry.lambda_value = reg_param
-            else:
-                entry.lambda_value = basics.optimal_lambda(entry.A_re, entry.A_im, entry.b_re, entry.b_im,
-                                                           entry.M, data_used, induct_used, -3, cv_type)
-            entry = _finalize_fitted_entry_for_display(entry, source_entry, used_kk)
-            if update_ui:
+        if update_ui and mode == 'simple':
+            try:
                 self.ui.reg_param_entry_2.setText(str(entry.lambda_value))
-
-        elif mode == 'bayesian':
-            source_entry = entry
-            entry, used_kk = _prepare_entry_for_drt_fit(entry)
-            rbf_type = str(self.ui.discre_choice.currentText())
-            data_used = str(self.ui.data_used_choice.currentText())
-            induct_used = int(self.ui.induct_choice.currentIndex())
-            der_used = str(self.ui.der_choice.currentText())
-            cv_type = str(self.ui.lambda_choice.currentText())
-            reg_param = float(self.ui.reg_param_entry.text())
-            shape_control = str(self.ui.shape_control_choice.currentText())
-            coeff = float(self.ui.FWHM_entry.text())
-            sample_number = int(self.ui.sample_no_entry.text())
-
-            entry = Bayesian_run(entry, rbf_type=rbf_type, data_used=data_used, induct_used=induct_used,
-                                 der_used=der_used, cv_type=cv_type, reg_param=reg_param,
-                                 shape_control=shape_control, coeff=coeff, NMC_sample=sample_number)
-            entry = _finalize_fitted_entry_for_display(entry, source_entry, used_kk)
-
-        elif mode == 'BHT':
-            rbf_type = str(self.ui.discre_choice.currentText())
-            der_used = str(self.ui.der_choice.currentText())
-            shape_control = str(self.ui.shape_control_choice.currentText())
-            coeff = float(self.ui.FWHM_entry.text())
-
-            entry = BHT_run(entry, rbf_type, der_used, shape_control, coeff)
-
-        else:
-            return
+            except Exception:
+                pass
 
         self.data_store[key] = entry
         if key == getattr(self, 'current_file_key', None):
@@ -2465,58 +2165,32 @@ class GUI(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # Real multi-process scheduling: one file per process.
-        # Leave one logical core for the GUI/main OS tasks.
-        logical_cores = int(os.cpu_count() or 1)
-        max_processes = max(1, logical_cores - 1)
-        worker_count = min(len(to_fit), max_processes)
-
-        # Each process stays single-threaded internally. Increasing this value
-        # usually only causes BLAS oversubscription and does not speed up CVXOPT.
+        # Start at roughly 1.5 processes per physical core, then let the
+        # standalone backend raise concurrency toward the logical CPU count
+        # while total CPU use remains below the target.  Page-file/DLL failures
+        # still trigger a retry of only unfinished files with half the workers.
         params['native_threads'] = 1
+        tasks = [(key, self.data_store[key]) for key in to_fit]
 
         try:
-            mp.freeze_support()
-            mp_context = mp.get_context('spawn')
-            self._fit_executor = ProcessPoolExecutor(
-                max_workers=worker_count,
-                mp_context=mp_context,
+            info = self._fit_process_manager.start(tasks, mode, params, signature)
+            self._fit_worker_count = int(info.get('worker_count', 1) or 1)
+            self._fit_initial_worker_count = int(info.get('initial_worker_count', self._fit_worker_count) or 1)
+            self._fit_max_worker_count = int(info.get('maximum_worker_count', self._fit_worker_count) or self._fit_worker_count)
+            self._fit_process_note = ''
+            self.statusBar().showMessage(
+                f'Preparing Fit All: {self._fit_all_total}/{self._fit_all_total} tasks queued | '
+                f'{self._fit_worker_count} active / {self._fit_max_worker_count} max processes '
+                f'(physical {info.get("physical_cores", "?")}, logical {info.get("logical_cores", "?")})'
             )
-            self._fit_worker_count = worker_count
-            self._fit_futures = {}
-
-            for submitted, key in enumerate(to_fit, start=1):
-                try:
-                    entry_copy = copy.deepcopy(self.data_store.get(key))
-                except Exception:
-                    entry_copy = self.data_store.get(key)
-
-                future = self._fit_executor.submit(
-                    _fit_process_task,
-                    key,
-                    entry_copy,
-                    mode,
-                    params,
-                    signature,
-                )
-                self._fit_futures[future] = key
-
-                try:
-                    self.statusBar().showMessage(
-                        f'Preparing Fit All: {submitted}/{self._fit_all_total} tasks submitted | {worker_count} processes'
-                    )
-                    QtWidgets.QApplication.processEvents()
-                except Exception:
-                    pass
-
             self._fit_poll_timer.start()
-
         except Exception as e:
             self._fit_all_active = False
             self._fit_all_pending = 0
-            self._shutdown_fit_process_pool(cancel=True)
+            self._shutdown_fit_process_pool(cancel=True, terminate=True)
+            error_text = str(e)
             try:
-                QtWidgets.QMessageBox.warning(self, 'Fit All failed to start', str(e))
+                QtWidgets.QMessageBox.warning(self, 'Fit All failed to start', error_text)
             except Exception:
                 pass
             return
@@ -2533,17 +2207,19 @@ class GUI(QtWidgets.QMainWindow):
         percent = int(round(100.0 * completed / total)) if total else 100
         processes = int(getattr(self, '_fit_worker_count', 0) or 0)
         skipped = int(getattr(self, '_fit_all_skipped', 0) or 0)
+        note = str(getattr(self, '_fit_process_note', '') or '')
+        suffix = f' | {note}' if note else ''
         try:
             self.statusBar().showMessage(
                 f'Fitting: {completed}/{total} completed ({percent}%) | '
                 f'{remaining} remaining | {processes} processes | '
-                f'{errors} errors | {skipped} skipped'
+                f'{errors} errors | {skipped} skipped{suffix}'
             )
         except Exception:
             pass
 
     def _build_fit_params(self, mode: str) -> dict:
-        """Read all fitting parameters from UI once; safe to pass into worker threads."""
+        """Read all fitting parameters from UI once; safe to pass into worker processes."""
         params = {}
         # For parallel Fit All, limit each task to 1 native BLAS/OMP thread so
         # multiple fits can run concurrently without oversubscribing the CPU.
@@ -2565,79 +2241,62 @@ class GUI(QtWidgets.QMainWindow):
         return params
 
     def _poll_fit_processes(self):
-        """Collect completed process futures in the Qt main thread."""
+        """Collect process results and handle automatic page-file fallback."""
         if not getattr(self, '_fit_all_active', False):
-            try:
-                self._fit_poll_timer.stop()
-            except Exception:
-                pass
+            self._fit_poll_timer.stop()
             return
 
-        completed = [
-            future for future in list(getattr(self, '_fit_futures', {}).keys())
-            if future.done()
-        ]
+        try:
+            batch = self._fit_process_manager.poll()
+        except Exception as exc:
+            # A manager-level error is terminal; account for every unfinished task.
+            unfinished = max(0, int(getattr(self, '_fit_all_pending', 0) or 0))
+            for index in range(unfinished):
+                self._on_fit_worker_error(f'Fit task {index + 1}', str(exc))
+            return
 
-        for future in completed:
-            key = self._fit_futures.pop(future, None)
-            if key is None:
-                continue
+        retry = batch.get('retry')
+        scale = batch.get('scale')
+        if retry:
+            self._fit_worker_count = int(retry.get('to_workers', 1) or 1)
+            self._fit_max_worker_count = self._fit_worker_count
+            self._fit_process_note = (
+                f'virtual memory fallback {retry.get("from_workers", "?")}→'
+                f'{retry.get("to_workers", "?")}'
+            )
+        elif scale:
+            self._fit_worker_count = int(scale.get('to_workers', self._fit_worker_count) or self._fit_worker_count)
+            cpu_value = scale.get('cpu_percent')
+            cpu_text = f' | CPU {float(cpu_value):.0f}%' if cpu_value is not None else ''
+            self._fit_process_note = (
+                f'auto scale {scale.get("from_workers", "?")}→'
+                f'{scale.get("to_workers", "?")}{cpu_text}'
+            )
+        else:
+            self._fit_worker_count = int(batch.get('worker_count', self._fit_worker_count) or self._fit_worker_count)
 
-            try:
-                result_key, fitted_entry, signature = future.result()
-                self._on_fit_worker_finished(result_key, fitted_entry, signature)
-            except Exception as e:
-                self._on_fit_worker_error(key, str(e))
+        for key, fitted_entry, signature in batch.get('results', []):
+            self._on_fit_worker_finished(key, fitted_entry, signature)
 
-        if not self._fit_futures and getattr(self, '_fit_all_pending', 0) <= 0:
-            try:
-                self._fit_poll_timer.stop()
-            except Exception:
-                pass
+        for key, message in batch.get('errors', []):
+            self._on_fit_worker_error(key, message)
 
+        if retry or scale:
+            self._update_fit_all_progress_status()
+
+        if batch.get('done') and getattr(self, '_fit_all_pending', 0) <= 0:
+            self._fit_poll_timer.stop()
 
     def _shutdown_fit_process_pool(self, cancel: bool = False, terminate: bool = False):
-        """Best-effort cleanup for the Fit All process executor."""
+        """Stop the standalone Fit All backend."""
         try:
             self._fit_poll_timer.stop()
         except Exception:
             pass
-
-        futures = getattr(self, '_fit_futures', {}) or {}
-        if cancel:
-            for future in list(futures.keys()):
-                try:
-                    future.cancel()
-                except Exception:
-                    pass
-
-        executor = getattr(self, '_fit_executor', None)
-
-        # On application close, actively terminate running child processes so
-        # Python does not wait for unfinished fits after the window disappears.
-        if terminate and executor is not None:
-            try:
-                for process in list(getattr(executor, '_processes', {}).values()):
-                    try:
-                        process.terminate()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        if executor is not None:
-            try:
-                executor.shutdown(wait=False, cancel_futures=bool(cancel))
-            except TypeError:
-                try:
-                    executor.shutdown(wait=False)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        self._fit_executor = None
-        self._fit_futures = {}
+        try:
+            self._fit_process_manager.shutdown(cancel=cancel, terminate=terminate)
+        except Exception:
+            pass
         self._fit_worker_count = 0
 
 
@@ -2695,6 +2354,7 @@ class GUI(QtWidgets.QMainWindow):
         """Finalize Fit All after all process workers complete."""
         self._fit_all_active = False
         self._shutdown_fit_process_pool(cancel=False)
+        self._fit_process_note = ''
 
         try:
             current_key = self._fit_all_restore.get('current_key')
@@ -4336,21 +3996,28 @@ class GUI(QtWidgets.QMainWindow):
         if not np.any(np.isfinite(kk_res_im)) and getattr(entry, 'kk_res_im_pct', None) is not None:
             kk_res_im = map_active(getattr(entry, 'kk_res_im_pct', []))
 
+        initial_im = np.asarray(zim0, dtype=float)
         return {
             'key': key,
             'name': self._display_name_for_key(key),
             'freq': np.asarray(freq0, dtype=float),
             'initial_re': np.asarray(zre0, dtype=float),
-            'initial_im': np.asarray(zim0, dtype=float),
+            'initial_neg_im': -initial_im,
+            'initial_im': initial_im,
             'masked_re': masked_re,
+            'masked_neg_im': -masked_im,
             'masked_im': masked_im,
             'kk_re': kk_re,
+            'kk_neg_im': -kk_im,
             'kk_im': kk_im,
             'drt_re': drt_re,
+            'drt_neg_im': -drt_im,
             'drt_im': drt_im,
             'kk_res_re': kk_res_re,
+            'kk_res_neg_im': -kk_res_im,
             'kk_res_im': kk_res_im,
             'drt_res_re': drt_res_re,
+            'drt_res_neg_im': -drt_res_im,
             'drt_res_im': drt_res_im,
         }
 
@@ -4361,20 +4028,27 @@ class GUI(QtWidgets.QMainWindow):
         if options['freq']:
             groups.append(('Frequency', [('Freq/Hz', 'freq')]))
 
+        # All EIS columns are optional. Keep the display/export order:
+        # Freq, Z', -Z'', Z''.
         value_components = []
         if options['z_re']:
             value_components.append(("Z'/ohm", 're'))
+        if options['z_neg_im']:
+            value_components.append(("-Z''/ohm", 'neg_im'))
         if options['z_im']:
-            value_components.append(('Z"/ohm', 'im'))
+            value_components.append(("Z''/ohm", 'im'))
 
         residual_components_ohm = []
         residual_components_pct = []
         if options['z_re']:
             residual_components_ohm.append(("Z' residual/ohm", 're'))
             residual_components_pct.append(("Z' residual/%", 're'))
+        if options['z_neg_im']:
+            residual_components_ohm.append(("-Z'' residual/ohm", 'neg_im'))
+            residual_components_pct.append(("-Z'' residual/%", 'neg_im'))
         if options['z_im']:
-            residual_components_ohm.append(('Z" residual/ohm', 'im'))
-            residual_components_pct.append(('Z" residual/%', 'im'))
+            residual_components_ohm.append(("Z'' residual/ohm", 'im'))
+            residual_components_pct.append(("Z'' residual/%", 'im'))
 
         type_map = [
             ('initial', 'Initial EIS data', 'initial'),
@@ -4495,11 +4169,18 @@ class GUI(QtWidgets.QMainWindow):
 
         cb_freq = QtWidgets.QCheckBox('Freq', dialog)
         cb_z_re = QtWidgets.QCheckBox("Z'", dialog)
-        cb_z_im = QtWidgets.QCheckBox('Z"', dialog)
+        cb_z_neg_im = QtWidgets.QCheckBox("-Z''", dialog)
+        cb_z_im = QtWidgets.QCheckBox("Z''", dialog)
+
+        # All four columns can be selected independently.
         cb_freq.setChecked(True)
         cb_z_re.setChecked(True)
-        cb_z_im.setChecked(True)
-        add_option_row('EIS data columns', [cb_freq, cb_z_re, cb_z_im])
+        cb_z_neg_im.setChecked(True)
+        cb_z_im.setChecked(False)
+        add_option_row(
+            'EIS data columns',
+            [cb_freq, cb_z_re, cb_z_neg_im, cb_z_im],
+        )
 
         cb_initial = QtWidgets.QCheckBox('Initial data', dialog)
         cb_masked = QtWidgets.QCheckBox('Masked data', dialog)
@@ -4536,6 +4217,7 @@ class GUI(QtWidgets.QMainWindow):
         return {
             'freq': cb_freq.isChecked(),
             'z_re': cb_z_re.isChecked(),
+            'z_neg_im': cb_z_neg_im.isChecked(),
             'z_im': cb_z_im.isChecked(),
             'initial': cb_initial.isChecked(),
             'masked': cb_masked.isChecked(),
@@ -4562,8 +4244,7 @@ class GUI(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(
                 self,
                 'Export EIS',
-                'Please select at least one exportable column. When exporting EIS data or residuals, '
-                'select Z\' and/or Z".',
+                'Please select at least one EIS data type or residual type to export.',
             )
             return
 
@@ -5386,14 +5067,6 @@ class Figure_Canvas(FigureCanvas):
             self.axes.set_yticks([0, 50, 100])
             self.axes.set_ylabel(r'$\rm Scores (\%)$')
 
-
-if __name__ == "__main__":  # starting the GUI when users run this file
-
-    mp.freeze_support()
-    app = QtWidgets.QApplication(sys.argv)
-    MainWindow = GUI()
-    MainWindow.show()
-    sys.exit(app.exec_())
 
 # ---------------- __SIDEBAR_TAB_REFACTOR__ ----------------
 # Safe runtime refactor: does NOT modify GUI class source structure.
@@ -6382,3 +6055,7 @@ def launch_gui():
 
     MainWindow.show()
     app.exec_()
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    launch_gui()

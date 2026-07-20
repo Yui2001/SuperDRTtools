@@ -1,10 +1,13 @@
-__authors__ = 'Francesco Ciucci, Adeleke Maradesa'
+# -*- coding: utf-8 -*-
+"""Windows multiprocessing-safe launcher for SuperDRTtools."""
 
-__date__ = '16th Jan., 2024'
+import multiprocessing as mp
 
-from pyDRTtools.GUI import launch_gui
 
 def main():
+    # Keep this import inside the guarded function.  Spawned Fit All workers
+    # execute launch.py while preparing, but must not import the GUI/SciPy stack.
+    from pyDRTtools.GUI import launch_gui
     try:
         import pyi_splash
         pyi_splash.close()
@@ -13,5 +16,7 @@ def main():
 
     launch_gui()
 
+
 if __name__ == "__main__":
+    mp.freeze_support()
     main()
