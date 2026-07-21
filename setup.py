@@ -14,7 +14,7 @@ def readme():
 
 entry_points={
         "console_scripts": [
-            "launchGUI=pyDRTtools.cli:main",
+            "launchGUI=pyDRTtools.app.cli:main",
         ],
     }
 
@@ -62,7 +62,9 @@ setuptools.setup(
         "Operating System :: OS Independent",
           
     ],
-    packages=['pyDRTtools'],
+    # Include the controller/service/UI subpackages introduced by the GUI
+    # refactor while preserving the public ``pyDRTtools`` package.
+    packages=setuptools.find_packages(include=['pyDRTtools', 'pyDRTtools.*']),
     include_package_data=True,
     package_data={'pyDRTtools': ['EIS data/*']},  # Specify package data
 )

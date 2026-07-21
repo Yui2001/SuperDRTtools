@@ -7,7 +7,7 @@ import multiprocessing as mp
 def main():
     # Keep this import inside the guarded function.  Spawned Fit All workers
     # execute launch.py while preparing, but must not import the GUI/SciPy stack.
-    from pyDRTtools.GUI import launch_gui
+    from pyDRTtools.app.bootstrap import launch_gui
     try:
         import pyi_splash
         pyi_splash.close()

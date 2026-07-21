@@ -32,7 +32,8 @@ The software is intended to make routine EIS analysis more efficient by combinin
 ### DRT and fitting
 - Simple, Bayesian, and Hilbert-transform workflows
 - Tikhonov-based DRT computation
-- Peak analysis and deconvolution
+- Automatic or user-selected peak deconvolution with Peak One / Peak All
+- Peak position, frequency, resistance contribution, fraction, and FWHM results
 - Fit One and multiprocessing-based Fit All
 - Live fitting progress in the status bar
 
@@ -53,7 +54,8 @@ The software is intended to make routine EIS analysis more efficient by combinin
 
 ### Multi-file workflow
 - Multi-file `.csv` / `.txt` import
-- Drag-and-drop support
+- Drag-and-drop support for EIS data and `.sdrtp` project files
+- Independent multi-window workspaces
 - Automatic handling of common impedance-sign conventions
 - File reordering, status tracking, and renaming
 - Project open, save, overwrite, and save-as workflows
@@ -63,7 +65,7 @@ The software is intended to make routine EIS analysis more efficient by combinin
 
 ### Visualization and export
 - EIS, magnitude, phase, real, and imaginary views
-- DRT residual, DRT comparison, and DRT Map
+- DRT residual, DRT comparison, DRT Map, and Peak Comparison
 - Linked file/curve selection in DRT comparison
 - Configurable DRT and EIS data export
 - Separate or merged CSV output
@@ -121,6 +123,17 @@ The software is intended to make routine EIS analysis more efficient by combinin
 - Click a curve or select its file in the Files panel to highlight the corresponding result.
 - The selected curve is shown in `#67001F`, while the remaining curves are faded without changing line width.
 
+### Peak analysis
+
+- Select `Auto` to estimate the peak count from the DRT, or choose a count manually.
+- Run peak deconvolution for the selected file or all files in background processes.
+- Review peak relaxation time, characteristic frequency, resistance contribution, percentage contribution, and FWHM.
+- Peak name, relaxation time, and resistance contribution are annotated beside each fitted peak in the DRT plot.
+- Double-click a peak annotation to rename only that peak or every matching peak in the project.
+- After two or more files have peak results, use **Peak Comparison** to compare named peak resistance contributions in Files-panel order.
+- Hover a Peak Comparison point to inspect its file, peak name, and resistance contribution.
+- Right-click Peak Comparison to configure an automatic or manual y-axis range.
+
 ### DRT Map
 
 - Display multi-file DRT results as a two-dimensional map.
@@ -133,6 +146,8 @@ The software is intended to make routine EIS analysis more efficient by combinin
 The Project card provides a simple save/load workflow:
 
 - **Open Project** loads a saved SuperDRTtools project.
+- Dropping a `.sdrtp` file asks whether to open it in this window or a new window.
+- **New Window** opens an independent blank workspace without changing the current project.
 - **Save Project** creates a project when the current session has not yet been saved.
 - When a project is already open, **Save Project** overwrites the current project.
 - Right-click the Save button to use **Save Project As...** and preserve a different analysis state.
@@ -148,6 +163,12 @@ The EIS export dialog supports configurable output:
 - Use **Separate** mode to create one CSV per spectrum.
 - Use **Merged** mode to combine multiple spectra into one CSV using the displayed file names from the Files panel.
 - Exported arrays are aligned to the original frequency sequence; unavailable or masked values are left blank.
+
+### Peak export
+
+- Export the selected file's complete peak metrics as CSV.
+- Export all analyzed files to one Excel workbook, with one worksheet per file.
+- Reports include peak name, relaxation time, characteristic frequency, height, resistance contribution, percentage contribution, FWHM, and component index.
 
 ---
 
@@ -216,21 +237,24 @@ python launch.py
 
 ```text
 SuperDRTtools/
-├─ launch.py
-├─ pyDRTtools/
-│  ├─ __init__.py
-│  ├─ GUI.py
-│  ├─ layout.py
-│  ├─ project_io.py
-│  ├─ basics.py
-│  ├─ parameter_selection.py
-│  ├─ runs.py
-│  └─ ...
-├─ manual/
-├─ docs/
-│  └─ images/
-└─ README.md
+|-- launch.py
+|-- pyDRTtools/
+|   |-- app/                 # application bootstrap and main-window composition
+|   |-- algorithms/          # numerical DRT, BHT, sampling, and peak algorithms
+|   |-- controllers/         # feature-specific GUI workflows
+|   |-- infrastructure/      # multiprocessing Fit All and Peak Analysis backends
+|   |-- services/            # EIS state, peak metrics, and project storage
+|   |-- ui/                  # layout, canvas, widgets, and theme
+|   `-- __init__.py          # lazy package-level aliases
+|-- docs/
+|-- tutorial/
+`-- README.md
 ```
+
+The GUI uses a feature-oriented architecture while the established numerical
+algorithm modules remain isolated and unchanged. See
+[Architecture](docs/ARCHITECTURE.md) for module responsibilities and dependency
+rules.
 
 ---
 
@@ -241,6 +265,28 @@ SuperDRTtools can be packaged as a Windows executable with PyInstaller:
 ```bash
 python -m PyInstaller --noconfirm --clean --windowed --add-data "launchImg/launch.png;launchImg" --splash launchImg\launch.png --onefile --name SuperDRTtools launch.py
 ```
+
+For the smaller production build, use the separately maintained optimized
+specification. The original specification remains available as a conservative
+fallback:
+
+```powershell
+.\build_optimized.ps1
+```
+
+When building from a PyCharm PyInstaller run configuration, select the same
+Conda interpreter and use the spec file directly:
+
+```text
+SuperDRTtools_optimized.spec --noconfirm --clean
+```
+
+The spec locates Conda runtime DLLs from the active interpreter automatically;
+the PowerShell helper is optional.
+
+The optimized build removes development/notebook packages, unused Matplotlib
+backends, unused Qt modules/plugins, translations, and package source/test
+resources. It does not modify numerical algorithms.
 
 When using multiprocessing-based Fit All in a packaged Windows application, keep the application entry point protected by the standard `if __name__ == "__main__":` block.
 

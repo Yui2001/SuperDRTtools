@@ -47,13 +47,16 @@ FIT_ALL_LOW_CPU_SAMPLES_REQUIRED = 2
 # Reduce concurrency gradually after a page-file/DLL resource failure.
 FIT_ALL_FALLBACK_STEP = 1
 
-# Commit-memory guard.  It is deliberately checked before the first spawn and
-# before every scale-up because waiting for a page-file exception is too late
-# on systems that hard-freeze under commit pressure.
-FIT_ALL_START_COMMIT_RESERVE_GIB = 6.0
-FIT_ALL_START_COMMIT_PER_PROCESS_MIB = 1024
-FIT_ALL_SCALE_COMMIT_RESERVE_GIB = 6.0
-FIT_ALL_SCALE_COMMIT_PER_ADDED_PROCESS_MIB = 1024
+# Commit-memory guard.  A fixed 6 GiB reserve forced otherwise healthy systems
+# down to one worker whenever available commit dipped slightly below that
+# value.  Use a proportional reserve instead: preserve enough headroom for the
+# desktop and GUI while allowing more workers on machines with modest page
+# files.  Scale-up remains staged and rechecks commit before every new worker.
+FIT_ALL_COMMIT_RESERVE_FRACTION = 0.35
+FIT_ALL_MIN_COMMIT_RESERVE_GIB = 2.0
+FIT_ALL_MAX_COMMIT_RESERVE_GIB = 6.0
+FIT_ALL_START_COMMIT_PER_PROCESS_MIB = 768
+FIT_ALL_SCALE_COMMIT_PER_ADDED_PROCESS_MIB = 512
 
 _RESOURCE_ERROR_MARKERS = (
     "页面文件太小",
@@ -176,11 +179,20 @@ def _memory_safe_worker_count(requested_workers: int) -> Tuple[int, Optional[flo
     if available is None:
         return requested, None
 
-    reserve = int(FIT_ALL_START_COMMIT_RESERVE_GIB * (1024 ** 3))
+    reserve = _commit_reserve_bytes(available)
     per_worker = int(FIT_ALL_START_COMMIT_PER_PROCESS_MIB * (1024 ** 2))
     usable = max(0, available - reserve)
     allowed = max(1, int(usable // max(1, per_worker)))
     return max(1, min(requested, allowed)), available / (1024 ** 3)
+
+
+def _commit_reserve_bytes(available: int) -> int:
+    """Return a proportional system reserve bounded by safe desktop limits."""
+    gib = 1024 ** 3
+    minimum = int(FIT_ALL_MIN_COMMIT_RESERVE_GIB * gib)
+    maximum = int(FIT_ALL_MAX_COMMIT_RESERVE_GIB * gib)
+    proportional = int(max(0, available) * FIT_ALL_COMMIT_RESERVE_FRACTION)
+    return min(maximum, max(minimum, proportional))
 
 
 def _set_worker_below_normal_priority() -> None:
@@ -369,8 +381,8 @@ def run_fit_entry(entry, mode: str, params: dict):
         raise ValueError("Empty entry")
 
     params = dict(params or {})
-    from . import basics
-    from .runs import BHT_run, Bayesian_run, simple_run
+    from ..algorithms import basics
+    from ..algorithms.runs import BHT_run, Bayesian_run, simple_run
 
     if mode == "simple":
         source_entry = entry
@@ -596,6 +608,7 @@ class FitProcessManager:
         self._prime_cpu_sampler()
 
         initial, available_commit_gib = _memory_safe_worker_count(initial)
+        memory_limited_initial = initial < self.initial_worker_count
         self.initial_available_commit_gib = available_commit_gib
         workers = self._start_with_submission_fallback(initial)
         self.worker_count = workers
@@ -609,6 +622,7 @@ class FitProcessManager:
             "hard_cap": self.hard_cap,
             "task_count": len(self.tasks),
             "initial_available_commit_gib": self.initial_available_commit_gib,
+            "memory_limited_initial": memory_limited_initial,
         }
 
     def _start_with_submission_fallback(self, workers: int) -> int:
@@ -682,7 +696,7 @@ class FitProcessManager:
         available = _available_commit_bytes()
         if available is None:
             return True, None
-        reserve = int(FIT_ALL_SCALE_COMMIT_RESERVE_GIB * (1024 ** 3))
+        reserve = _commit_reserve_bytes(available)
         incremental = int(
             max(1, int(added_workers))
             * FIT_ALL_SCALE_COMMIT_PER_ADDED_PROCESS_MIB
